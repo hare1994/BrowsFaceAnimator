@@ -227,12 +227,17 @@ function removeBrows(src, face) {
   const m = mask.getContext('2d');
   m.fillStyle = '#fff'; m.strokeStyle = '#fff';
   m.lineJoin = 'round'; m.lineCap = 'round';
-  m.lineWidth = eyeW * 0.36;
   const brows = [LM.browPolyR, LM.browPolyL];
-  for (const poly of brows) {
-    m.beginPath();
-    poly.forEach((i, k) => (k ? m.lineTo(P[i].x, P[i].y) : m.moveTo(P[i].x, P[i].y)));
-    m.closePath(); m.fill(); m.stroke();
+  // Asymmetric dilation: generous above and to the sides (stray hairs),
+  // tight underneath so the eyelid crease / eyeshadow stays untouched.
+  const lift = eyeW * 0.07;
+  for (const [w, dy] of [[0.2, 0], [0.34, -lift]]) {
+    m.lineWidth = eyeW * w;
+    for (const poly of brows) {
+      m.beginPath();
+      poly.forEach((i, k) => (k ? m.lineTo(P[i].x, P[i].y + dy) : m.moveTo(P[i].x, P[i].y + dy)));
+      m.closePath(); m.fill(); m.stroke();
+    }
   }
 
   const sctx = src.getContext('2d', { willReadFrequently: true });
@@ -240,6 +245,51 @@ function removeBrows(src, face) {
   const d = img.data;
   const md = m.getImageData(0, 0, W, H).data;
   const inMask = (x, y) => x >= 0 && y >= 0 && x < W && y < H && md[(y * W + x) * 4 + 3] > 127;
+
+  // Skin reference + catch stray brow hairs just outside the mask.
+  const ringCv = makeCanvas(W, H), rg = ringCv.getContext('2d');
+  rg.strokeStyle = '#fff'; rg.fillStyle = '#fff'; rg.lineJoin = 'round'; rg.lineCap = 'round';
+  rg.lineWidth = eyeW * 0.72;
+  for (const poly of brows) {
+    rg.beginPath();
+    poly.forEach((i, k) => (k ? rg.lineTo(P[i].x, P[i].y) : rg.moveTo(P[i].x, P[i].y)));
+    rg.closePath(); rg.fill(); rg.stroke();
+  }
+  const ringD = rg.getImageData(0, 0, W, H).data;
+  const ringIdx = [];
+  for (let k = 0; k < W * H; k++) if (ringD[k * 4 + 3] > 127 && md[k * 4 + 3] <= 127) ringIdx.push(k);
+  const ringLum = ringIdx.map((k) => lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2])).sort((a, b) => a - b);
+  const skinLum = ringLum.length ? ringLum[Math.floor(ringLum.length * 0.7)] : 180;
+  // lower edge of each brow (landmarks), used as a floor for growing
+  const lowerR = [46, 53, 52, 65, 55].map((i) => P[i]), lowerL = [276, 283, 282, 295, 285].map((i) => P[i]);
+  const floorY = (x) => {
+    const line = Math.abs(x - lowerR[4].x) < Math.abs(x - lowerL[4].x) ? lowerR : lowerL;
+    const pts = [...line].sort((a, b) => a.x - b.x);
+    if (x <= pts[0].x) return pts[0].y;
+    if (x >= pts[pts.length - 1].x) return pts[pts.length - 1].y;
+    for (let i = 1; i < pts.length; i++) if (x <= pts[i].x) {
+      const t = (x - pts[i - 1].x) / Math.max(1, pts[i].x - pts[i - 1].x);
+      return lerp(pts[i - 1].y, pts[i].y, t);
+    }
+    return pts[0].y;
+  };
+  const grown = [];
+  for (const k of ringIdx) {
+    const x = k % W, y = (k / W) | 0;
+    if (y > floorY(x) + eyeW * 0.03) continue;
+    if (lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2]) < skinLum * 0.62) { md[k * 4 + 3] = 255; grown.push(k); }
+  }
+  for (const k of grown) { // include the soft edges of those hairs
+    const x = k % W, y = (k / W) | 0;
+    for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+      const xx = x + ox, yy = y + oy;
+      if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+      const kk = yy * W + xx;
+      if (ringD[kk * 4 + 3] > 127 && yy <= floorY(xx) + eyeW * 0.03 && lum(d[kk * 4], d[kk * 4 + 1], d[kk * 4 + 2]) < skinLum * 0.85) md[kk * 4 + 3] = 255;
+    }
+  }
+  m.putImageData(new ImageData(new Uint8ClampedArray(md), W, H), 0, 0);
+  if (window.__brow) window.__brow.lastMask = mask;
 
   // Hair colour: darkest pixels inside the (un-dilated) brow polygons.
   const tight = makeCanvas(W, H).getContext('2d');
@@ -298,7 +348,57 @@ function removeBrows(src, face) {
   // 1) Smooth base: multi-scale harmonic fill (each missing pixel becomes the
   //    average of its neighbours), so light and shading flow in seamlessly
   //    from the clean skin around the brows.
+  //    Two solutions: H1 uses all surrounding skin; H2 replaces the skin
+  //    *below* the brows (lid crease / eyeshadow) with brow-bone tone, so
+  //    the shadow does not bleed up as a muddy band. H1 is only used right
+  //    next to the lower edge, keeping that edge seamless.
+  const imgB = new Float32Array(img3);
+  {
+    const ref = new Float32Array(rw * 3), has = new Uint8Array(rw);
+    for (let x = 0; x < rw; x++) {
+      let t = -1;
+      for (let y = 0; y < rh; y++) if (unk[y * rw + x]) { t = y; break; }
+      if (t < 0) continue;
+      let n = 0;
+      for (let y = Math.max(0, t - 8); y < t - 1; y++) {
+        const j = y * rw + x; if (unk[j]) continue;
+        for (let c = 0; c < 3; c++) ref[x * 3 + c] += img3[j * 3 + c];
+        n++;
+      }
+      if (n) { for (let c = 0; c < 3; c++) ref[x * 3 + c] /= n; has[x] = 1; }
+    }
+    // fill columns without a reference from the nearest one, then smooth
+    let last = -1;
+    for (let x = 0; x < rw; x++) if (has[x]) { if (last < 0) for (let k = 0; k < x; k++) for (let c = 0; c < 3; c++) ref[k * 3 + c] = ref[x * 3 + c]; last = x; }
+      else if (last >= 0) for (let c = 0; c < 3; c++) ref[x * 3 + c] = ref[last * 3 + c];
+    const rr = Math.max(3, Math.round(eyeW * 0.12)), sm = new Float32Array(rw * 3);
+    for (let x = 0; x < rw; x++) {
+      let n = 0;
+      for (let o = -rr; o <= rr; o++) { const xx = Math.min(rw - 1, Math.max(0, x + o)); for (let c = 0; c < 3; c++) sm[x * 3 + c] += ref[xx * 3 + c]; n++; }
+      for (let c = 0; c < 3; c++) sm[x * 3 + c] /= n;
+    }
+    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+      const j = y * rw + x;
+      if (unk[j]) continue;
+      if (y + ry0 > floorY(x + rx0) - eyeW * 0.02) for (let c = 0; c < 3; c++) imgB[j * 3 + c] = sm[x * 3 + c];
+    }
+  }
   solveHarmonic(img3, unk, rw, rh);
+  solveHarmonic(imgB, unk, rw, rh);
+  {
+    const band = Math.max(3, eyeW * 0.1);
+    for (let x = 0; x < rw; x++) {
+      let below = -1; // nearest known pixel below, scanning upwards
+      for (let y = rh - 1; y >= 0; y--) {
+        const j = y * rw + x;
+        if (!unk[j]) { below = y; continue; }
+        const db = below < 0 ? 1e9 : below - y;
+        const w = 1 - smooth(db / band); // 1 at the lower edge -> H1
+        for (let c = 0; c < 3; c++) img3[j * 3 + c] = lerp(imgB[j * 3 + c], img3[j * 3 + c], w);
+      }
+    }
+  }
+
 
   // 2) Skin texture: copy fine detail (pores, freckles, grain) from the
   //    forehead right above the brows onto the smooth base.
@@ -315,15 +415,32 @@ function removeBrows(src, face) {
     }
     return d[(y * W + x) * 4 + c] - sum / n;
   };
+  // Only copy from clean skin: skip edges (fingers, hairline, stray hairs)
+  // and fall back to fine grain of matching strength.
+  const rndT = mulberry32(99);
+  let grainSum = 0, grainN = 0;
+  const lumDetail = (x, y) => 0.299 * detail(x, y, 0) + 0.587 * detail(x, y, 1) + 0.114 * detail(x, y, 2);
   for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
     const j2 = y * rw + x;
     if (!unk[j2]) continue;
     const ix = x + rx0, iy = y + ry0;
-    let sy = iy - shiftUp;
-    // mirror back down if the forehead patch runs off the image or into the mask
-    if (sy < R || inMask(ix, sy)) sy = iy - Math.round(shiftUp * 0.6);
-    if (sy < R || inMask(ix, sy)) continue;
-    for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += clamp(detail(ix, sy, c), -40, 40) * 0.9;
+    let done = false;
+    for (const f of [1, 0.75, 1.3, 0.55]) {
+      const sy = iy - Math.round(shiftUp * f);
+      if (sy < R || inMask(ix, sy)) continue;
+      const k = (sy * W + ix) * 4;
+      if (Math.abs(lum(d[k], d[k + 1], d[k + 2]) - skinLum) > 45) continue;
+      const L = lumDetail(ix, sy);
+      if (Math.abs(L) > 12) continue;
+      for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += clamp(detail(ix, sy, c), -14, 14) * 0.85;
+      grainSum += Math.abs(L); grainN++;
+      done = true; break;
+    }
+    if (!done) {
+      const g = (grainN ? grainSum / grainN : 3) * 1.1;
+      const n = (rndT() + rndT() + rndT() - 1.5) * g;
+      for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += n;
+    }
   }
 
   const filled = makeCanvas(W, H);
@@ -365,7 +482,7 @@ function removeBrows(src, face) {
     const contrast = skin ? lum(...skin) - lum(c.r, c.g, c.b) : 0;
     if (contrast > 45) {
       // deepen slightly: drawn brows read lighter than real hair
-      hair = rgbToHex({ r: c.r * 0.8, g: c.g * 0.78, b: c.b * 0.76 });
+      hair = rgbToHex({ r: c.r * 0.72, g: c.g * 0.7, b: c.b * 0.68 });
     } else if (skin) {
       // no real brows: a soft brown derived from skin tone
       hair = rgbToHex({ r: skin[0] * 0.12 + 22, g: skin[1] * 0.09 + 14, b: skin[2] * 0.07 + 10 });
@@ -374,7 +491,7 @@ function removeBrows(src, face) {
   // faint or very light brows give a washed-out colour: keep it deep enough to read
   if (hair) {
     const c = hexToRgb(hair), L = lum(c.r, c.g, c.b);
-    if (L > 80) { const k = 80 / L; hair = rgbToHex({ r: c.r * k, g: c.g * k, b: c.b * k }); }
+    if (L > 70) { const k = 70 / L; hair = rgbToHex({ r: c.r * k, g: c.g * k, b: c.b * k }); }
   }
   return { canvas: result, hair };
 }
@@ -396,32 +513,32 @@ function settings() {
 function mapBrows(face, s) {
   const { midX, eyeY, eyeW } = face;
 
-  // Proportions below are calibrated against the reference mapping
-  // (all in eye-widths, measured from the pupil line).
-  //   inner bottom 0.52 · inner top 0.91 · arch top 1.05 · tail 0.47
+  // Proportions (eye-widths from the pupil line) follow a full, natural,
+  // softly angled brow: low full head, steady rise to an arch above the
+  // outer eye corner, tail finishing a little above the head.
+  //   head 0.40–0.67 · arch 0.62–0.89 · tail 0.46
 
-  // Brow base, nudged towards where her own brow bone sits.
-  const idealBot = eyeY - 0.53 * eyeW;
-  const ownBot = face.browInBotY - 0.09 * eyeW;
-  const innerBotY = Math.abs(ownBot - idealBot) < 0.2 * eyeW ? lerp(idealBot, ownBot, 0.5) : idealBot;
+  // Brow base: mostly where her own brow bone / brow sits.
+  const idealBot = eyeY - 0.45 * eyeW;
+  const ownBot = face.browInBotY + 0.06 * eyeW;
+  const innerBotY = Math.abs(ownBot - idealBot) < 0.3 * eyeW ? lerp(idealBot, ownBot, 0.85) : idealBot;
 
-  const thickness = 0.33 * eyeW * s.thick;
+  const thickness = 0.27 * eyeW * s.thick;
   const innerTopY = innerBotY - thickness;
-  const archTopY = innerTopY - 0.14 * eyeW * s.lift;
-  const archThick = thickness * 0.66;
+  const archTopY = innerTopY - 0.22 * eyeW * s.lift;
+  const archThick = thickness * 0.85;
 
   const ax = face.noseHalf, ay = face.nostrilY;
 
   // 1) start: up from the nostril edge, pulled in towards the bridge of the
   //    nose (never wider than the inner eye corner)
-  const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.72 * s.gap;
-  // 2) arch: line from the nostril edge through the centre of the pupil,
-  //    where it crosses the arch height
-  const archSlope = (face.irisHalf - ax) / (ay - eyeY);
-  const archHalf = ax + archSlope * (ay - archTopY) * s.arch;
+  const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.8 * s.gap;
+  // 2) arch: straight above the outer corner of the eye
+  const archHalf = face.outerHalf * 1.03 * s.arch;
+  const archSlope = (archHalf - ax) / Math.max(1, ay - archTopY);
   // 3) tail: line from the nostril edge past the outer eye corner
-  //    (the reference line clears the corner by ~0.21 eye-widths)
-  const tailY = innerBotY + 0.05 * eyeW;
+  //    (clears the corner by ~0.21 eye-widths)
+  const tailY = innerBotY - 0.06 * eyeW;
   const slope = (face.outerHalf + 0.21 * eyeW - ax) / (ay - face.outerY); // half-x gained per px climbed
   const tailHalfIdeal = ax + slope * (ay - tailY);
   const tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
@@ -482,15 +599,15 @@ function makeStrokes(face, geo, s) {
   //   1 main hairs
   //   2 fine dark crisp hairs on top
   const layers = [
-    { share: 0.3, len: [0.08, 0.15], w: 1.1, alpha: [0.22, 0.4], shade: [1.1, 1.45] },
-    { share: 0.45, len: [0.07, 0.14], w: 0.95, alpha: [0.35, 0.65], shade: [0.9, 1.2] },
-    { share: 0.25, len: [0.05, 0.11], w: 0.75, alpha: [0.5, 0.85], shade: [0.7, 0.95] },
+    { share: 0.3, len: [0.08, 0.16], w: 1.1, alpha: [0.3, 0.5], shade: [1.0, 1.3] },
+    { share: 0.45, len: [0.07, 0.15], w: 0.95, alpha: [0.45, 0.75], shade: [0.8, 1.05] },
+    { share: 0.25, len: [0.05, 0.12], w: 0.75, alpha: [0.6, 0.9], shade: [0.6, 0.85] },
   ];
 
   for (const side of geo.sides) {
     const xs = side.outline.map((p) => p.x), ys = side.outline.map((p) => p.y);
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    const total = Math.round(1700 * s.thick);
+    const total = Math.round(2600 * s.thick);
     let made = 0, tries = 0;
     while (made < total && tries < total * 50) {
       tries++;
@@ -498,7 +615,7 @@ function makeStrokes(face, geo, s) {
       if (!probe.isPointInPath(side.path, x, y)) continue;
       const u = clamp((Math.abs(x - midX) - geo.innerHalf) / span);
       // sparse, soft head; slightly sparser tail tip
-      if (u < 0.22 && rnd() > 0.1 + 0.9 * smooth(u / 0.22)) continue;
+      if (u < 0.16 && rnd() > 0.3 + 0.7 * smooth(u / 0.16)) continue;
       if (u > 0.9 && rnd() > 1 - (u - 0.9) * 5) continue;
       made++;
 
@@ -516,7 +633,8 @@ function makeStrokes(face, geo, s) {
       else if (u < archU) a = lerp(55, 18, smooth((u - 0.18) / Math.max(0.01, archU - 0.18)));
       else a = lerp(12, -24, smooth((u - archU) / Math.max(0.01, 1 - archU)));
       if (u >= 0.18) a += (0.5 - v) * 34;  // herringbone: lower hairs rise, upper hairs lie down
-      a += (rnd() - 0.5) * 14;
+      if (v > 0.75 && u >= 0.18) a -= (v - 0.75) * 40; // groomed, crisp top edge
+      a += (rnd() - 0.5) * 10;
       const rad = (a * Math.PI) / 180;
       const len = eyeW * lerp(ly.len[0], ly.len[1], rnd()) * (u < 0.15 ? 0.75 : 1);
       const dx = side.sg * Math.cos(rad) * len, dy = -Math.sin(rad) * len;
@@ -599,7 +717,7 @@ function buildTimeline(face, geo) {
       [1.8, 'Centre line'],
       [2.8, 'Start: inner nose line, straight up'],
       [4.1, 'Brow height'],
-      [6.1, 'Arch: outer edge of the iris'],
+      [6.1, 'Arch: above the outer eye corner'],
       [7.2, 'Tail: nostril → outer eye corner'],
       [9.4, 'Mapping points'],
       [10.3, 'Connecting the shape'],
