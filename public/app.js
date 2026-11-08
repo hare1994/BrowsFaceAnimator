@@ -369,26 +369,32 @@ function settings() {
 function mapBrows(face, s) {
   const { midX, eyeY, eyeW } = face;
 
-  // Brow base: bottom of the inner brow, ~0.58 eye-widths above the pupils
-  // (blended with where her own brow bone sits).
-  const idealBot = eyeY - 0.58 * eyeW;
-  const ownBot = face.browInBotY;
-  const innerBotY = Math.abs(ownBot - idealBot) < 0.25 * eyeW ? lerp(idealBot, ownBot, 0.5) : idealBot;
+  // Proportions below are calibrated against the reference mapping
+  // (all in eye-widths, measured from the pupil line).
+  //   inner bottom 0.52 · inner top 0.91 · arch top 1.05 · tail 0.47
 
-  const thickness = 0.3 * eyeW * s.thick;
+  // Brow base, nudged towards where her own brow bone sits.
+  const idealBot = eyeY - 0.53 * eyeW;
+  const ownBot = face.browInBotY - 0.09 * eyeW;
+  const innerBotY = Math.abs(ownBot - idealBot) < 0.2 * eyeW ? lerp(idealBot, ownBot, 0.5) : idealBot;
+
+  const thickness = 0.36 * eyeW * s.thick;
   const innerTopY = innerBotY - thickness;
-  const archTopY = innerTopY - 0.12 * eyeW * s.lift;
-  const archThick = thickness * 0.66;
+  const archTopY = innerTopY - 0.14 * eyeW * s.lift;
+  const archThick = thickness * 0.68;
+
+  const ax = face.noseHalf, ay = face.nostrilY;
 
   // 1) start: straight up from the nostril edge
-  const innerHalf = face.noseHalf;
-  // 2) arch: between the outer edge of the iris and the outer eye corner
-  const irisEdge = face.irisHalf + face.irisRad;
-  const archHalf = lerp(irisEdge, face.outerHalf, s.arch);
-  // 3) tail: diagonal from the nostril edge through the outer eye corner
-  const tailY = innerBotY + 0.04 * eyeW;
-  const ax = face.noseHalf, ay = face.nostrilY, ox = face.outerHalf, oy = face.outerY;
-  const slope = (ox - ax) / (ay - oy); // half-x gained per px climbed
+  const innerHalf = ax;
+  // 2) arch: line from the nostril edge through the centre of the pupil,
+  //    where it crosses the arch height
+  const archSlope = (face.irisHalf - ax) / (ay - eyeY);
+  const archHalf = ax + archSlope * (ay - archTopY) * s.arch;
+  // 3) tail: line from the nostril edge past the outer eye corner
+  //    (the reference line clears the corner by ~0.21 eye-widths)
+  const tailY = innerBotY + 0.05 * eyeW;
+  const slope = (face.outerHalf + 0.21 * eyeW - ax) / (ay - face.outerY); // half-x gained per px climbed
   const tailHalfIdeal = ax + slope * (ay - tailY);
   const tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
 
@@ -423,7 +429,7 @@ function mapBrows(face, s) {
 
   const geo = {
     innerHalf, archHalf, tailHalf, innerTopY, innerBotY, archTopY, tailY, thickness, archThick,
-    slope, sides,
+    slope, archSlope, sides,
   };
   geo.strokes = makeStrokes(face, geo, s);
   return geo;
