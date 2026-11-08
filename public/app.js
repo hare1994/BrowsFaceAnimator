@@ -31,7 +31,7 @@ const els = {
   intro: $('intro'), studio: $('studio'), drop: $('drop'), file: $('file'),
   stage: $('stage'), caption: $('caption'), status: $('status'),
   replay: $('replay'), compare: $('compare'), controls: $('controls'),
-  thick: $('thick'), lift: $('lift'), arch: $('arch'), tail: $('tail'),
+  thick: $('thick'), lift: $('lift'), arch: $('arch'), tail: $('tail'), gap: $('gap'),
   color: $('color'), style: $('style'),
   measure: $('measure'), measureList: $('measureList'),
   savePng: $('savePng'), saveVid: $('saveVid'), newPhoto: $('newPhoto'),
@@ -347,8 +347,13 @@ function removeBrows(src, face) {
       hair = rgbToHex({ r: c.r * 0.8, g: c.g * 0.78, b: c.b * 0.76 });
     } else if (skin) {
       // no real brows: a soft brown derived from skin tone
-      hair = rgbToHex({ r: skin[0] * 0.2 + 18, g: skin[1] * 0.15 + 12, b: skin[2] * 0.12 + 9 });
+      hair = rgbToHex({ r: skin[0] * 0.12 + 22, g: skin[1] * 0.09 + 14, b: skin[2] * 0.07 + 10 });
     }
+  }
+  // faint or very light brows give a washed-out colour: keep it deep enough to read
+  if (hair) {
+    const c = hexToRgb(hair), L = lum(c.r, c.g, c.b);
+    if (L > 80) { const k = 80 / L; hair = rgbToHex({ r: c.r * k, g: c.g * k, b: c.b * k }); }
   }
   return { canvas: result, hair };
 }
@@ -361,6 +366,7 @@ function settings() {
     lift: +els.lift.value,
     arch: +els.arch.value,
     tail: +els.tail.value,
+    gap: +els.gap.value,
     color: els.color.value,
     style: els.style.value,
   };
@@ -378,15 +384,16 @@ function mapBrows(face, s) {
   const ownBot = face.browInBotY - 0.09 * eyeW;
   const innerBotY = Math.abs(ownBot - idealBot) < 0.2 * eyeW ? lerp(idealBot, ownBot, 0.5) : idealBot;
 
-  const thickness = 0.36 * eyeW * s.thick;
+  const thickness = 0.33 * eyeW * s.thick;
   const innerTopY = innerBotY - thickness;
   const archTopY = innerTopY - 0.14 * eyeW * s.lift;
-  const archThick = thickness * 0.68;
+  const archThick = thickness * 0.66;
 
   const ax = face.noseHalf, ay = face.nostrilY;
 
-  // 1) start: straight up from the nostril edge
-  const innerHalf = ax;
+  // 1) start: up from the nostril edge, pulled in towards the bridge of the
+  //    nose (never wider than the inner eye corner)
+  const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.72 * s.gap;
   // 2) arch: line from the nostril edge through the centre of the pupil,
   //    where it crosses the arch height
   const archSlope = (face.irisHalf - ax) / (ay - eyeY);
@@ -407,17 +414,22 @@ function mapBrows(face, s) {
     const T = pt(X(tailHalf), tailY);
     const span1 = archHalf - innerHalf, span2 = tailHalf - archHalf;
 
-    const top = [IT];
-    cubic(IT, pt(X(innerHalf + span1 * 0.3), IT.y - (IT.y - AT.y) * 0.85), pt(X(archHalf - span1 * 0.3), AT.y), AT, 24, top);
-    cubic(AT, pt(X(archHalf + span2 * 0.3), AT.y), pt(X(tailHalf - span2 * 0.35), T.y - (T.y - AT.y) * 0.45), T, 20, top);
+    // top edge: soft rounded front, then an almost straight rise to the arch
+    const frontTop = pt(X(innerHalf + span1 * 0.12), innerTopY - (innerTopY - archTopY) * 0.22);
+    const top = [];
+    cubic(IT, pt(X(innerHalf + span1 * 0.02), IT.y - thickness * 0.08), pt(X(innerHalf + span1 * 0.07), frontTop.y + thickness * 0.02), frontTop, 8, top);
+    cubic(frontTop, pt(X(innerHalf + span1 * 0.5), frontTop.y - (frontTop.y - AT.y) * 0.7), pt(X(archHalf - span1 * 0.18), AT.y), AT, 24, top);
+    cubic(AT, pt(X(archHalf + span2 * 0.28), AT.y), pt(X(tailHalf - span2 * 0.3), T.y - (T.y - AT.y) * 0.5), T, 20, top);
+    top.unshift(IT);
 
+    // bottom edge: nearly straight, lifting slightly under the arch, then to the tail
     const bottom = [T];
-    cubic(T, pt(X(tailHalf - span2 * 0.45), T.y - (T.y - AB.y) * 0.25), pt(X(archHalf + span2 * 0.35), AB.y), AB, 20, bottom);
-    cubic(AB, pt(X(archHalf - span1 * 0.35), AB.y), pt(X(innerHalf + span1 * 0.35), IB.y - (IB.y - AB.y) * 0.05), IB, 24, bottom);
+    cubic(T, pt(X(tailHalf - span2 * 0.4), T.y - (T.y - AB.y) * 0.3), pt(X(archHalf + span2 * 0.3), AB.y), AB, 20, bottom);
+    cubic(AB, pt(X(archHalf - span1 * 0.4), AB.y), pt(X(innerHalf + span1 * 0.3), IB.y - (IB.y - AB.y) * 0.1), IB, 24, bottom);
 
-    // rounded inner end
+    // rounded inner end, slightly fuller at the bottom like a natural brow head
     const front = [];
-    cubic(IB, pt(IB.x - sg * thickness * 0.18, IB.y - thickness * 0.15), pt(IT.x - sg * thickness * 0.12, IT.y + thickness * 0.2), IT, 10, front);
+    cubic(IB, pt(IB.x - sg * thickness * 0.22, IB.y - thickness * 0.1), pt(IT.x - sg * thickness * 0.2, IT.y + thickness * 0.35), IT, 10, front);
 
     const outline = [...top, ...bottom.slice(1), ...front];
     const path = new Path2D();
@@ -442,45 +454,69 @@ function makeStrokes(face, geo, s) {
   const strokes = [];
   const base = hexToRgb(s.color);
   const archU = (geo.archHalf - geo.innerHalf) / (geo.tailHalf - geo.innerHalf);
+  const span = geo.tailHalf - geo.innerHalf;
+
+  // Three layers, like real brows / microblading:
+  //   0 soft under-hairs (lighter, wider, low opacity)
+  //   1 main hairs
+  //   2 fine dark crisp hairs on top
+  const layers = [
+    { share: 0.34, len: [0.08, 0.15], w: 1.35, alpha: [0.16, 0.32], shade: [1.15, 1.5] },
+    { share: 0.46, len: [0.07, 0.13], w: 1.0, alpha: [0.3, 0.6], shade: [0.9, 1.2] },
+    { share: 0.2, len: [0.05, 0.1], w: 0.7, alpha: [0.5, 0.85], shade: [0.7, 0.95] },
+  ];
 
   for (const side of geo.sides) {
     const xs = side.outline.map((p) => p.x), ys = side.outline.map((p) => p.y);
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    const count = Math.round(560 * s.thick);
-    let tries = 0;
-    while (strokes.filter((k) => k.sg === side.sg).length < count && tries < count * 40) {
+    const total = Math.round(900 * s.thick);
+    let made = 0, tries = 0;
+    while (made < total && tries < total * 50) {
       tries++;
       const x = lerp(minX, maxX, rnd()), y = lerp(minY, maxY, rnd());
       if (!probe.isPointInPath(side.path, x, y)) continue;
-      const u = clamp((Math.abs(x - midX) - geo.innerHalf) / (geo.tailHalf - geo.innerHalf));
-      // thin out the very front for a soft, natural start
-      if (u < 0.12 && rnd() > 0.35 + u * 4) continue;
+      const u = clamp((Math.abs(x - midX) - geo.innerHalf) / span);
+      // sparse, soft head; slightly sparser tail tip
+      if (u < 0.14 && rnd() > 0.3 + u * 5) continue;
+      if (u > 0.9 && rnd() > 1 - (u - 0.9) * 5) continue;
+      made++;
+
+      const r = rnd();
+      const L = r < layers[0].share ? 0 : r < layers[0].share + layers[1].share ? 1 : 2;
+      const ly = layers[L];
 
       // vertical position inside the brow at this x (0 = bottom, 1 = top)
       const topY = lerp(geo.innerTopY, geo.archTopY, smooth(u / Math.max(archU, 0.01)));
-      const v = clamp((geo.innerBotY - y) / Math.max(1, geo.innerBotY - topY));
+      const botY = lerp(geo.innerBotY, geo.archTopY + geo.archThick, smooth(u / Math.max(archU, 0.01)));
+      const v = clamp((botY - y) / Math.max(1, botY - topY));
 
       let a; // degrees above horizontal, pointing towards the tail
-      if (u < archU) a = lerp(78, 14, smooth(u / archU));
-      else a = lerp(14, -22, smooth((u - archU) / (1 - archU)));
-      if (u > 0.15) a += (0.5 - v) * 26; // herringbone: low hairs rise, high hairs lie down
-      a += (rnd() - 0.5) * 16;
+      if (u < 0.18) a = lerp(88, 62, u / 0.18) - v * 12;           // head: hairs stand up, fanning out
+      else if (u < archU) a = lerp(55, 18, smooth((u - 0.18) / Math.max(0.01, archU - 0.18)));
+      else a = lerp(12, -24, smooth((u - archU) / Math.max(0.01, 1 - archU)));
+      if (u >= 0.18) a += (0.5 - v) * 34;  // herringbone: lower hairs rise, upper hairs lie down
+      a += (rnd() - 0.5) * 14;
       const rad = (a * Math.PI) / 180;
-      const len = eyeW * (u < 0.15 ? lerp(0.05, 0.1, rnd()) : lerp(0.07, 0.13, rnd()));
+      const len = eyeW * lerp(ly.len[0], ly.len[1], rnd()) * (u < 0.15 ? 0.75 : 1);
       const dx = side.sg * Math.cos(rad) * len, dy = -Math.sin(rad) * len;
-      const bend = (rnd() - 0.3) * 0.25 * len;
-      const shade = lerp(0.82, 1.25, rnd());
+      // hairs curve gently towards the tail
+      const bend = len * lerp(0.08, 0.22, rnd());
+      const nx = side.sg * Math.sin(rad), ny = Math.cos(rad);
+      const shade = lerp(ly.shade[0], ly.shade[1], rnd());
+      const col = { r: clamp(base.r * shade + (L === 0 ? 18 : 0), 0, 255), g: clamp(base.g * shade + (L === 0 ? 10 : 0), 0, 255), b: clamp(base.b * shade, 0, 255) };
       strokes.push({
-        sg: side.sg, u,
-        x, y, cx: x + dx * 0.5 + side.sg * bend * Math.sin(rad), cy: y + dy * 0.5 + bend * Math.cos(rad) * 0.5,
+        sg: side.sg, u, L,
+        order: u * 0.75 + L * 0.1 + rnd() * 0.05,
+        x, y,
+        cx: x + dx * 0.5 + nx * bend, cy: y + dy * 0.5 + ny * bend,
         ex: x + dx, ey: y + dy,
-        w: Math.max(0.5, eyeW * 0.0075) * lerp(0.7, 1.3, rnd()),
-        alpha: lerp(0.35, 0.8, rnd()) * (u < 0.1 ? 0.6 : 1),
-        color: `rgb(${clamp(base.r * shade, 0, 255) | 0},${clamp(base.g * shade, 0, 255) | 0},${clamp(base.b * shade, 0, 255) | 0})`,
+        w: Math.max(0.45, eyeW * 0.0068) * ly.w * lerp(0.75, 1.25, rnd()),
+        alpha: lerp(ly.alpha[0], ly.alpha[1], rnd()) * (u < 0.12 ? 0.7 : 1),
+        color: `rgb(${col.r | 0},${col.g | 0},${col.b | 0})`,
       });
     }
   }
-  strokes.sort((a, b) => a.u - b.u);
+  strokes.sort((a, b) => a.L - b.L);
   return strokes;
 }
 
@@ -497,7 +533,7 @@ function buildTimeline(face, geo) {
   add({ color: COLORS.yellow, a: pt(midX, chinY), b: pt(midX, topY), t0: 1.9, d: 0.9, tip: true });
   // nostril verticals -> brow start
   for (const sg of [-1, 1]) {
-    const x = midX + sg * face.noseHalf;
+    const x = midX + sg * geo.innerHalf;
     add({ color: COLORS.yellow, a: pt(x, chinY - eyeW * 0.1), b: pt(x, topY + eyeW * 0.2), t0: 2.8 + (sg > 0 ? 0.25 : 0), d: 0.9, tip: true });
   }
   // brow-top (short), brow-bottom (short), arch line (long)
@@ -540,7 +576,7 @@ function buildTimeline(face, geo) {
     captions: [
       [0, 'Removing the brows'],
       [1.8, 'Centre line'],
-      [2.8, 'Start: nostril edge, straight up'],
+      [2.8, 'Start: inner nose line, straight up'],
       [4.1, 'Brow height'],
       [6.1, 'Arch: outer edge of the iris'],
       [7.2, 'Tail: nostril → outer eye corner'],
@@ -595,43 +631,106 @@ function drawGrid(c, alpha) {
   c.restore();
 }
 
+const layerCache = { hair: null, powder: null, mask: null, maskKey: '' };
+
+function layerCanvas(key) {
+  const { W, H } = state;
+  let cv = layerCache[key];
+  if (!cv || cv.width !== W || cv.height !== H) cv = layerCache[key] = makeCanvas(W, H);
+  return cv;
+}
+
+// Soft-edged mask of both brows (image space), so hairs fade out at the
+// edges instead of being cut along a hard outline.
+function browMask() {
+  const geo = state.brows;
+  if (layerCache.mask && layerCache.maskKey === geo) return layerCache.mask;
+  const cv = layerCanvas('mask');
+  const m = cv.getContext('2d');
+  m.setTransform(1, 0, 0, 1, 0, 0);
+  m.clearRect(0, 0, cv.width, cv.height);
+  m.save();
+  faceTransform(m);
+  m.filter = `blur(${Math.max(1, state.face.eyeW * 0.03)}px)`;
+  m.fillStyle = '#000'; m.strokeStyle = '#000';
+  m.lineWidth = state.face.eyeW * 0.03; m.lineJoin = 'round';
+  for (const side of geo.sides) { m.fill(side.path); m.stroke(side.path); }
+  m.restore();
+  layerCache.mask = cv; layerCache.maskKey = geo;
+  return cv;
+}
+
 function drawBrows(c, progress) {
   if (progress <= 0) return;
   const s = settings();
   const geo = state.brows;
   const rgb = hexToRgb(s.color);
+  const mask = browMask();
+  const eyeW = state.face.eyeW;
 
   if (s.style !== 'strokes') {
-    // powder base with an ombré front
+    // powder: soft ombré tint, multiplied so skin texture shows through
+    const pw = layerCanvas('powder');
+    const p = pw.getContext('2d');
+    p.setTransform(1, 0, 0, 1, 0, 0);
+    p.clearRect(0, 0, pw.width, pw.height);
+    p.save();
+    faceTransform(p);
+    p.filter = `blur(${Math.max(1, eyeW * 0.04)}px)`;
+    const k = s.style === 'powder' ? 1 : 0.5;
     for (const side of geo.sides) {
-      const g = c.createLinearGradient(side.IT.x, 0, side.T.x, 0);
-      const k = s.style === 'powder' ? 1 : 0.7;
-      g.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.12 * k})`);
-      g.addColorStop(0.3, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.6 * k})`);
-      g.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.72 * k})`);
-      c.save();
-      c.globalAlpha = smooth(progress * 1.4);
-      c.filter = `blur(${Math.max(1, state.face.eyeW * 0.022)}px)`;
-      c.fillStyle = g;
-      c.fill(side.path);
-      c.restore();
+      const g = p.createLinearGradient(side.IT.x, 0, side.T.x, 0);
+      g.addColorStop(0, `rgba(${rgb.r},${rgb.g},${rgb.b},0)`);
+      g.addColorStop(0.18, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.35 * k})`);
+      g.addColorStop(0.55, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.75 * k})`);
+      g.addColorStop(1, `rgba(${rgb.r},${rgb.g},${rgb.b},${0.6 * k})`);
+      p.fillStyle = g;
+      p.fill(side.path);
     }
-  }
-  if (s.style !== 'powder') {
-    const n = Math.floor(geo.strokes.length * clamp(progress));
+    p.restore();
     c.save();
-    // keep hairs inside the mapped shape (slightly grown so edges stay soft)
-    const clip = new Path2D();
-    for (const side of geo.sides) clip.addPath(side.path);
-    c.clip(clip);
-    c.lineCap = 'round';
-    for (let i = 0; i < n; i++) {
-      const k = geo.strokes[i];
-      c.globalAlpha = k.alpha;
-      c.strokeStyle = k.color;
-      c.lineWidth = k.w;
-      c.beginPath(); c.moveTo(k.x, k.y); c.quadraticCurveTo(k.cx, k.cy, k.ex, k.ey); c.stroke();
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalAlpha = smooth(progress * 1.3);
+    c.globalCompositeOperation = 'multiply';
+    c.drawImage(pw, 0, 0);
+    c.restore();
+  }
+
+  if (s.style !== 'powder') {
+    const hv = layerCanvas('hair');
+    const h = hv.getContext('2d');
+    h.setTransform(1, 0, 0, 1, 0, 0);
+    h.clearRect(0, 0, hv.width, hv.height);
+    h.save();
+    faceTransform(h);
+    h.lineCap = 'round';
+    const reveal = clamp(progress) * 1.05;
+    for (const k of geo.strokes) {
+      if (k.order > reveal) continue;
+      h.strokeStyle = k.color;
+      // tapered hair: thick root, fine tip (3 segments along the curve)
+      let px = k.x, py = k.y;
+      for (let i = 1; i <= 3; i++) {
+        const t = i / 3, u = 1 - t;
+        const qx = u * u * k.x + 2 * u * t * k.cx + t * t * k.ex;
+        const qy = u * u * k.y + 2 * u * t * k.cy + t * t * k.ey;
+        h.globalAlpha = k.alpha * (1 - (i - 1) * 0.18);
+        h.lineWidth = k.w * (1.15 - (i - 1) * 0.38);
+        h.beginPath(); h.moveTo(px, py); h.lineTo(qx, qy); h.stroke();
+        px = qx; py = qy;
+      }
     }
+    h.restore();
+    // fade hairs at the brow edges
+    h.globalCompositeOperation = 'destination-in';
+    h.drawImage(mask, 0, 0);
+    h.globalCompositeOperation = 'source-over';
+
+    c.save();
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    // a hint of softness so hairs sit in the photo instead of on top of it
+    c.filter = `blur(${Math.max(0.25, eyeW * 0.0025)}px)`;
+    c.drawImage(hv, 0, 0);
     c.restore();
   }
 }
@@ -689,9 +788,13 @@ function render(t) {
   faceTransform(c);
 
   drawGrid(c, smooth((t - tl.gridStart) / (tl.gridEnd - tl.gridStart)) * guidesAlpha);
+  c.restore();
 
   // final brows (under the guides while they fade)
   drawBrows(c, (t - tl.fillStart) / (tl.fillEnd - tl.fillStart));
+
+  c.save();
+  faceTransform(c);
 
   if (guidesAlpha > 0) {
     for (const ln of tl.lines) {
@@ -901,6 +1004,7 @@ function syncOutputs() {
   $('liftV').textContent = `${Math.round(+els.lift.value * 100)}%`;
   $('archV').textContent = `${Math.round(+els.arch.value * 100)}%`;
   $('tailV').textContent = `${Math.round(+els.tail.value * 100)}%`;
+  $('gapV').textContent = `${Math.round(+els.gap.value * 100)}%`;
 }
 
 els.file.addEventListener('change', () => loadFile(els.file.files[0]));
@@ -914,7 +1018,7 @@ const holdOff = () => { if (!state.showOriginal) return; state.showOriginal = fa
 els.compare.addEventListener('pointerdown', holdOn);
 ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => els.compare.addEventListener(ev, holdOff));
 
-[els.thick, els.lift, els.arch, els.tail, els.color, els.style].forEach((el) =>
+[els.thick, els.lift, els.arch, els.tail, els.gap, els.color, els.style].forEach((el) =>
   el.addEventListener('input', () => { syncOutputs(); rebuild(); }));
 
 els.savePng.addEventListener('click', savePng);
