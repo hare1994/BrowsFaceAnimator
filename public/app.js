@@ -167,6 +167,59 @@ function buildFace(lmNorm, W, H) {
 
 /* ------------------------------ brow removal ------------------------------ */
 
+// Fills unknown pixels (unk=1) so each equals the mean of its 4 neighbours.
+// Solved coarse-to-fine so large holes converge quickly.
+function solveHarmonic(img, unk, w, h) {
+  const anyUnknown = unk.some((v) => v);
+  if (!anyUnknown) return;
+  if (w > 16 && h > 16) {
+    const w2 = Math.ceil(w / 2), h2 = Math.ceil(h / 2);
+    const img2 = new Float32Array(w2 * h2 * 3), unk2 = new Uint8Array(w2 * h2);
+    for (let y = 0; y < h2; y++) for (let x = 0; x < w2; x++) {
+      let r = 0, g = 0, b = 0, n = 0, holes = 0;
+      for (let oy = 0; oy < 2; oy++) for (let ox = 0; ox < 2; ox++) {
+        const xx = Math.min(w - 1, 2 * x + ox), yy = Math.min(h - 1, 2 * y + oy), j = yy * w + xx;
+        if (unk[j]) { holes++; continue; }
+        r += img[j * 3]; g += img[j * 3 + 1]; b += img[j * 3 + 2]; n++;
+      }
+      const j2 = y * w2 + x;
+      if (holes) unk2[j2] = 1;
+      else { img2[j2 * 3] = r / n; img2[j2 * 3 + 1] = g / n; img2[j2 * 3 + 2] = b / n; }
+    }
+    solveHarmonic(img2, unk2, w2, h2);
+    // bilinear upsample of the coarse solution as the starting guess
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const j = y * w + x;
+      if (!unk[j]) continue;
+      const fx = Math.min(w2 - 1, Math.max(0, (x - 0.5) / 2)), fy = Math.min(h2 - 1, Math.max(0, (y - 0.5) / 2));
+      const xa = Math.floor(fx), ya = Math.floor(fy), xb = Math.min(w2 - 1, xa + 1), yb = Math.min(h2 - 1, ya + 1);
+      const tx = fx - xa, ty = fy - ya;
+      for (let c = 0; c < 3; c++) {
+        const v = (img2[(ya * w2 + xa) * 3 + c] * (1 - tx) + img2[(ya * w2 + xb) * 3 + c] * tx) * (1 - ty)
+                + (img2[(yb * w2 + xa) * 3 + c] * (1 - tx) + img2[(yb * w2 + xb) * 3 + c] * tx) * ty;
+        img[j * 3 + c] = v;
+      }
+    }
+  } else {
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let j = 0; j < w * h; j++) if (!unk[j]) { r += img[j * 3]; g += img[j * 3 + 1]; b += img[j * 3 + 2]; n++; }
+    if (!n) { r = g = b = 180; n = 1; }
+    for (let j = 0; j < w * h; j++) if (unk[j]) { img[j * 3] = r / n; img[j * 3 + 1] = g / n; img[j * 3 + 2] = b / n; }
+  }
+  const idx = [];
+  for (let j = 0; j < w * h; j++) if (unk[j]) idx.push(j);
+  for (let it = 0; it < 40; it++) {
+    for (const j of idx) {
+      const x = j % w, y = (j / w) | 0;
+      const l = x > 0 ? j - 1 : j + 1, r = x < w - 1 ? j + 1 : j - 1;
+      const u = y > 0 ? j - w : j + w, dn = y < h - 1 ? j + w : j - w;
+      for (let c = 0; c < 3; c++) {
+        img[j * 3 + c] = 0.25 * (img[l * 3 + c] + img[r * 3 + c] + img[u * 3 + c] + img[dn * 3 + c]);
+      }
+    }
+  }
+}
+
 function removeBrows(src, face) {
   const { W, H } = state;
   const { P, eyeW } = face;
@@ -174,7 +227,7 @@ function removeBrows(src, face) {
   const m = mask.getContext('2d');
   m.fillStyle = '#fff'; m.strokeStyle = '#fff';
   m.lineJoin = 'round'; m.lineCap = 'round';
-  m.lineWidth = eyeW * 0.3;
+  m.lineWidth = eyeW * 0.36;
   const brows = [LM.browPolyR, LM.browPolyL];
   for (const poly of brows) {
     m.beginPath();
@@ -225,103 +278,70 @@ function removeBrows(src, face) {
     return [r / n, g / n, b / n];
   }
 
-  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
-  if (bw <= 0 || bh <= 0) return { canvas: src, hair: null };
-  const acc = new Float32Array(bw * bh * 3);
-  const wsum = new Float32Array(bw * bh);
+  if (x1 < x0 || y1 < y0) return { canvas: src, hair: null };
+  const t0 = performance.now();
 
-  const addRun = (coords, a, b, len) => {
-    const w = 1 / (len * len);
-    for (let i = 0; i < coords.length; i++) {
-      const t = (i + 1) / (coords.length + 1);
-      const [x, y] = coords[i];
-      const j = (y - y0) * bw + (x - x0);
-      const ca = a || b, cb = b || a;
-      acc[j * 3] += lerp(ca[0], cb[0], t) * w;
-      acc[j * 3 + 1] += lerp(ca[1], cb[1], t) * w;
-      acc[j * 3 + 2] += lerp(ca[2], cb[2], t) * w;
-      wsum[j] += w;
-    }
-  };
-
-  // Vertical runs (dominant: short, skin above + below).
-  for (let x = x0; x <= x1; x++) {
-    let y = y0;
-    while (y <= y1) {
-      if (!inMask(x, y)) { y++; continue; }
-      const start = y; const coords = [];
-      while (y <= y1 && inMask(x, y)) { coords.push([x, y]); y++; }
-      const a = sample(x, start, 0, -1), b = sample(x, y - 1, 0, 1);
-      if (a || b) addRun(coords, a, b, coords.length);
-    }
-  }
-  // Horizontal runs (smooth along the brow).
-  for (let y = y0; y <= y1; y++) {
-    let x = x0;
-    while (x <= x1) {
-      if (!inMask(x, y)) { x++; continue; }
-      const start = x; const coords = [];
-      while (x <= x1 && inMask(x, y)) { coords.push([x, y]); x++; }
-      const a = sample(start, y, -1, 0), b = sample(x - 1, y, 1, 0);
-      if (a || b) addRun(coords, a, b, coords.length * 1.6);
-    }
+  // Work on a padded region around both brows.
+  const pad = Math.round(eyeW * 0.5);
+  const rx0 = Math.max(0, x0 - pad), ry0 = Math.max(0, y0 - pad);
+  const rx1 = Math.min(W - 1, x1 + pad), ry1 = Math.min(H - 1, y1 + pad);
+  const rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
+  const N = rw * rh;
+  const img3 = new Float32Array(N * 3);
+  const unk = new Uint8Array(N);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const j2 = y * rw + x, k = ((y + ry0) * W + (x + rx0)) * 4;
+    img3[j2 * 3] = d[k]; img3[j2 * 3 + 1] = d[k + 1]; img3[j2 * 3 + 2] = d[k + 2];
+    unk[j2] = md[k + 3] > 127 ? 1 : 0;
   }
 
-  // Normalise + light box blur to remove streaks.
-  const fill = new Float32Array(bw * bh * 3);
-  for (let j = 0; j < bw * bh; j++) {
-    if (wsum[j] > 0) for (let c = 0; c < 3; c++) fill[j * 3 + c] = acc[j * 3 + c] / wsum[j];
-  }
-  const blurPass = (horizontal, r) => {
-    const out = new Float32Array(fill.length);
-    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
-      const j = y * bw + x;
-      if (!wsum[j]) continue;
-      let s0 = 0, s1 = 0, s2 = 0, n = 0;
-      for (let o = -r; o <= r; o++) {
-        const xx = horizontal ? x + o : x, yy = horizontal ? y : y + o;
-        if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue;
-        const jj = yy * bw + xx;
-        if (!wsum[jj]) continue;
-        s0 += fill[jj * 3]; s1 += fill[jj * 3 + 1]; s2 += fill[jj * 3 + 2]; n++;
+  // 1) Smooth base: multi-scale harmonic fill (each missing pixel becomes the
+  //    average of its neighbours), so light and shading flow in seamlessly
+  //    from the clean skin around the brows.
+  solveHarmonic(img3, unk, rw, rh);
+
+  // 2) Skin texture: copy fine detail (pores, freckles, grain) from the
+  //    forehead right above the brows onto the smooth base.
+  const R = Math.max(2, Math.round(eyeW * 0.03));
+  const shiftUp = (y1 - y0) + Math.round(eyeW * 0.12);
+  const detail = (x, y, c) => {
+    let sum = 0, n = 0;
+    for (let oy = -R; oy <= R; oy++) {
+      const yy = y + oy; if (yy < 0 || yy >= H) continue;
+      for (let ox = -R; ox <= R; ox++) {
+        const xx = x + ox; if (xx < 0 || xx >= W) continue;
+        sum += d[(yy * W + xx) * 4 + c]; n++;
       }
-      out[j * 3] = s0 / n; out[j * 3 + 1] = s1 / n; out[j * 3 + 2] = s2 / n;
     }
-    fill.set(out);
+    return d[(y * W + x) * 4 + c] - sum / n;
   };
-  const r = Math.max(2, Math.round(eyeW * 0.03));
-  blurPass(true, r); blurPass(false, r); blurPass(true, r);
-
-  // Skin grain: measure fine texture on the forehead just above the mask.
-  let grain = 0, gn = 0;
-  for (let y = Math.max(1, y0 - Math.round(eyeW * 0.5)); y < y0 - 2; y++) {
-    for (let x = x0 + Math.round(bw * 0.3); x < x1 - Math.round(bw * 0.3); x += 2) {
-      const k = (y * W + x) * 4, k2 = k + 8;
-      grain += Math.abs(lum(d[k], d[k + 1], d[k + 2]) - lum(d[k2], d[k2 + 1], d[k2 + 2])); gn++;
-    }
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const j2 = y * rw + x;
+    if (!unk[j2]) continue;
+    const ix = x + rx0, iy = y + ry0;
+    let sy = iy - shiftUp;
+    // mirror back down if the forehead patch runs off the image or into the mask
+    if (sy < R || inMask(ix, sy)) sy = iy - Math.round(shiftUp * 0.6);
+    if (sy < R || inMask(ix, sy)) continue;
+    for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += clamp(detail(ix, sy, c), -40, 40) * 0.9;
   }
-  grain = gn ? clamp(grain / gn, 1, 10) : 3;
 
   const filled = makeCanvas(W, H);
   const fctx = filled.getContext('2d');
   const out = fctx.createImageData(W, H);
   out.data.set(d);
-  const rnd = mulberry32(7);
-  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
-    const j = (y - y0) * bw + (x - x0);
-    if (!wsum[j]) continue;
-    const k = (y * W + x) * 4;
-    const n = (rnd() + rnd() - 1) * grain * 1.1;
-    out.data[k] = fill[j * 3] + n;
-    out.data[k + 1] = fill[j * 3 + 1] + n;
-    out.data[k + 2] = fill[j * 3 + 2] + n;
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const j2 = y * rw + x;
+    if (!unk[j2]) continue;
+    const k = ((y + ry0) * W + (x + rx0)) * 4;
+    out.data[k] = img3[j2 * 3]; out.data[k + 1] = img3[j2 * 3 + 1]; out.data[k + 2] = img3[j2 * 3 + 2];
   }
   fctx.putImageData(out, 0, 0);
 
-  // Feather the patch into the photo.
+  // 3) Narrow feather so there is no visible seam.
   const feather = makeCanvas(W, H);
   const fe = feather.getContext('2d');
-  fe.filter = `blur(${Math.max(1.5, eyeW * 0.035)}px)`;
+  fe.filter = `blur(${Math.max(1, eyeW * 0.015)}px)`;
   fe.drawImage(mask, 0, 0);
   fctx.globalCompositeOperation = 'destination-in';
   fctx.drawImage(feather, 0, 0);
@@ -331,6 +351,7 @@ function removeBrows(src, face) {
   const rctx = result.getContext('2d');
   rctx.drawImage(src, 0, 0);
   rctx.drawImage(filled, 0, 0);
+  if (window.__brow) window.__brow.lastRemoveMs = Math.round(performance.now() - t0);
 
   // Hair colour estimate.
   let hair = null;
@@ -461,15 +482,15 @@ function makeStrokes(face, geo, s) {
   //   1 main hairs
   //   2 fine dark crisp hairs on top
   const layers = [
-    { share: 0.34, len: [0.08, 0.15], w: 1.35, alpha: [0.16, 0.32], shade: [1.15, 1.5] },
-    { share: 0.46, len: [0.07, 0.13], w: 1.0, alpha: [0.3, 0.6], shade: [0.9, 1.2] },
-    { share: 0.2, len: [0.05, 0.1], w: 0.7, alpha: [0.5, 0.85], shade: [0.7, 0.95] },
+    { share: 0.3, len: [0.08, 0.15], w: 1.1, alpha: [0.22, 0.4], shade: [1.1, 1.45] },
+    { share: 0.45, len: [0.07, 0.14], w: 0.95, alpha: [0.35, 0.65], shade: [0.9, 1.2] },
+    { share: 0.25, len: [0.05, 0.11], w: 0.75, alpha: [0.5, 0.85], shade: [0.7, 0.95] },
   ];
 
   for (const side of geo.sides) {
     const xs = side.outline.map((p) => p.x), ys = side.outline.map((p) => p.y);
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    const total = Math.round(900 * s.thick);
+    const total = Math.round(1700 * s.thick);
     let made = 0, tries = 0;
     while (made < total && tries < total * 50) {
       tries++;
@@ -477,7 +498,7 @@ function makeStrokes(face, geo, s) {
       if (!probe.isPointInPath(side.path, x, y)) continue;
       const u = clamp((Math.abs(x - midX) - geo.innerHalf) / span);
       // sparse, soft head; slightly sparser tail tip
-      if (u < 0.14 && rnd() > 0.3 + u * 5) continue;
+      if (u < 0.22 && rnd() > 0.1 + 0.9 * smooth(u / 0.22)) continue;
       if (u > 0.9 && rnd() > 1 - (u - 0.9) * 5) continue;
       made++;
 
@@ -651,7 +672,7 @@ function browMask() {
   m.clearRect(0, 0, cv.width, cv.height);
   m.save();
   faceTransform(m);
-  m.filter = `blur(${Math.max(1, state.face.eyeW * 0.03)}px)`;
+  m.filter = `blur(${Math.max(0.8, state.face.eyeW * 0.018)}px)`;
   m.fillStyle = '#000'; m.strokeStyle = '#000';
   m.lineWidth = state.face.eyeW * 0.03; m.lineJoin = 'round';
   for (const side of geo.sides) { m.fill(side.path); m.stroke(side.path); }
