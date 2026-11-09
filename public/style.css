@@ -286,3 +286,15 @@ main { max-width: 1100px; margin: 0 auto; }
 
   .busy { bottom: 10px; }
 }
+
+/* ---------- export settings ---------- */
+.export h2 { font-size: 15px; margin: 0 0 8px; }
+.exp-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 14px; margin: 6px 0; }
+.exp-row select { background: rgba(0,0,0,.2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 7px; font: inherit; max-width: 62%; }
+.logo-pick { display: flex; align-items: center; gap: 8px; }
+.logo-pick img { height: 32px; max-width: 80px; object-fit: contain; border-radius: 6px; background: rgba(255,255,255,.08); padding: 2px; }
+.btn.small { padding: 6px 12px; font-size: 13px; cursor: pointer; }
+@media (max-width: 860px) {
+  .export h2 { display: none; }
+  .exp-row select { padding: 10px; }
+}

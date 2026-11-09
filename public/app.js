@@ -36,7 +36,7 @@ const els = {
   thick: $('thick'), lift: $('lift'), arch: $('arch'), tail: $('tail'), gap: $('gap'),
   color: $('color'), style: $('style'),
   measure: $('measure'), measureList: $('measureList'),
-  savePng: $('savePng'), saveVid: $('saveVid'), newPhoto: $('newPhoto'),
+  format: $('format'), savePng: $('savePng'), saveVid: $('saveVid'), newPhoto: $('newPhoto'),
 };
 const ctx = els.stage.getContext('2d');
 
@@ -1355,7 +1355,8 @@ function render(t, c = ctx, opts = {}) {
   // caption
   let cap = '';
   for (const [ct, text] of tl.captions) if (t >= ct) cap = tr(text);
-  if (opts.burnCaption) burnCaption(c, cap);
+  if (opts.onCaption) opts.onCaption(cap);
+  else if (opts.burnCaption) burnCaption(c, cap);
   else if (c === ctx && els.caption.textContent !== cap) els.caption.textContent = cap;
 }
 
@@ -1399,7 +1400,7 @@ function introParticles() {
   introCache = { key: state.browInfo, list };
   return list;
 }
-function renderIntro(c, t) {
+function renderIntro(c, t, opts = {}) {
   const { W, H, face } = state;
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.clearRect(0, 0, W, H);
@@ -1447,7 +1448,8 @@ function renderIntro(c, t) {
     c.beginPath(); c.arc(q.x + q.vx * age, q.y + q.vy * age, q.r * (1 - k * 0.5), 0, Math.PI * 2); c.fill();
   }
   c.restore();
-  burnCaption(c, tr(t < 1.0 ? 'Analysing the face' : 'Erasing the brows'));
+  const cap = tr(t < 1.0 ? 'Analysing the face' : 'Erasing the brows');
+  if (opts.onCaption) opts.onCaption(cap); else burnCaption(c, cap);
 }
 
 /* ------------------------------ playback ------------------------------ */
@@ -1933,8 +1935,13 @@ if (/[?&]diag=1/.test(location.search)) runDiagnostics();
 /* ------------------------------ export ------------------------------ */
 
 function savePng() {
-  render(state.timeline.end);
-  els.stage.toBlob((blob) => download(blob, 'brow-mapping.png'), 'image/png');
+  const { W, H } = state;
+  const rc = document.createElement('canvas'); rc.width = W; rc.height = H;
+  render(state.timeline.end, rc.getContext('2d'), { onCaption: () => {} });
+  const [OW, OH] = exportSize();
+  const comp = makeComposer(OW, OH);
+  comp.frame(rc, '');
+  comp.canvas.toBlob((blob) => download(blob, `brow-mapping-${els.format.value.replace(':', 'x')}.png`), 'image/png');
 }
 
 function download(blob, name) {
@@ -1945,8 +1952,121 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
-// Records the whole story (erasing intro + mapping animation) on an off-screen
-// canvas: the picture on screen does not replay, the button shows progress.
+/* ------------------------------ export (video + image) ------------------------------
+ * The animation is rendered at photo size, then composed onto an output frame
+ * in the chosen format (9:16 Reels/TikTok, 16:9, 1:1 or original): the photo is
+ * fitted over a blurred copy of itself, captions are large and inside the
+ * platform's safe area, the optional logo sits in a corner, and the video ends
+ * with a before/after split.
+ * ------------------------------------------------------------------------------------- */
+const EXPORT_FORMATS = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080] };
+const exportLogo = { img: null };
+const OUTRO = 3.2;
+
+function exportSize() {
+  const f = EXPORT_FORMATS[els.format.value];
+  if (f) return f;
+  // original: photo aspect, long side 1080..1920
+  const { W, H } = state, k = Math.min(1920 / Math.max(W, H), Math.max(1, 1080 / Math.min(W, H)));
+  return [Math.round(W * k / 2) * 2, Math.round(H * k / 2) * 2];
+}
+
+function makeComposer(OW, OH) {
+  const out = document.createElement('canvas');
+  out.width = OW; out.height = OH;
+  const o = out.getContext('2d');
+  const { W, H } = state;
+  const k = Math.min(OW / W, OH / H), dw = W * k, dh = H * k;
+  const dx = (OW - dw) / 2, dy = (OH - dh) / 2;
+  // blurred background: built once from the erased photo
+  let bg = null;
+  if (dw < OW - 1 || dh < OH - 1) {
+    bg = document.createElement('canvas'); bg.width = OW; bg.height = OH;
+    const b = bg.getContext('2d');
+    const kc = Math.max(OW / W, OH / H);
+    b.filter = `blur(${Math.round(Math.min(OW, OH) * 0.03)}px) brightness(0.55)`;
+    b.drawImage(state.clean, (OW - W * kc) / 2, (OH - H * kc) / 2, W * kc, H * kc);
+  }
+  const vertical = OH > OW * 1.2;
+  function caption(text) {
+    if (!text) return;
+    const size = Math.round(Math.min(OW, OH) * (vertical ? 0.048 : 0.042));
+    o.save();
+    o.font = `700 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+    o.direction = getLang() === 'he' ? 'rtl' : 'ltr';
+    o.textAlign = 'center'; o.textBaseline = 'middle';
+    // Reels/TikTok cover the bottom ~20% with their own buttons: stay above it
+    const y = vertical ? OH * 0.72 : OH * 0.86;
+    const words = text.split(' '), lines = [];
+    let line = '';
+    for (const w of words) {
+      const test = line ? line + ' ' + w : w;
+      if (o.measureText(test).width > OW * 0.84 && line) { lines.push(line); line = w; } else line = test;
+    }
+    lines.push(line);
+    const lh = size * 1.25, padX = size * 0.7, padY = size * 0.45;
+    const boxW = Math.max(...lines.map((l) => o.measureText(l).width)) + padX * 2;
+    const boxH = lines.length * lh + padY * 2;
+    const top = y - boxH / 2;
+    o.fillStyle = 'rgba(15,12,11,0.62)';
+    o.beginPath();
+    o.roundRect ? o.roundRect(OW / 2 - boxW / 2, top, boxW, boxH, size * 0.5) : o.rect(OW / 2 - boxW / 2, top, boxW, boxH);
+    o.fill();
+    o.fillStyle = '#fff';
+    lines.forEach((l, i) => o.fillText(l, OW / 2, top + padY + lh * (i + 0.5)));
+    o.restore();
+  }
+  function logo() {
+    const img = exportLogo.img;
+    if (!img) return;
+    const maxW = OW * (vertical ? 0.3 : 0.18), maxH = OH * 0.09;
+    const k2 = Math.min(maxW / img.width, maxH / img.height);
+    const w = img.width * k2, h = img.height * k2, m = Math.min(OW, OH) * 0.04;
+    o.save();
+    o.globalAlpha = 0.95;
+    o.shadowColor = 'rgba(0,0,0,0.35)'; o.shadowBlur = m * 0.4;
+    o.drawImage(img, m, vertical ? OH * 0.06 : m, w, h);
+    o.restore();
+  }
+  return {
+    canvas: out,
+    frame(src, cap) {
+      o.setTransform(1, 0, 0, 1, 0, 0);
+      if (bg) o.drawImage(bg, 0, 0); else { o.fillStyle = '#000'; o.fillRect(0, 0, OW, OH); }
+      o.imageSmoothingQuality = 'high';
+      o.drawImage(src, dx, dy, dw, dh);
+      caption(cap);
+      logo();
+    },
+  };
+}
+
+// before | after split on the work canvas (t: seconds into the outro)
+function renderOutro(c, t) {
+  const { W, H } = state;
+  render(state.timeline.end, c, { onCaption: () => {} });
+  const after = document.createElement('canvas'); after.width = W; after.height = H;
+  after.getContext('2d').drawImage(c.canvas, 0, 0);
+  const x = lerp(W, W / 2, smooth(t / 0.9));
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.beginPath(); c.rect(0, 0, x, H); c.clip();
+  c.drawImage(state.orig, 0, 0);
+  c.restore();
+  c.save();
+  c.fillStyle = '#fff'; c.fillRect(x - Math.max(1.5, W * 0.003), 0, Math.max(3, W * 0.006), H);
+  const a = smooth((t - 0.8) / 0.4), size = Math.round(Math.min(W, H) * 0.045);
+  c.globalAlpha = a;
+  c.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  c.textBaseline = 'top'; c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = size * 0.4;
+  c.textAlign = 'center';
+  c.fillText(tr('Before'), W * 0.25, size * 0.8);
+  c.fillText(tr('After'), W * 0.75, size * 0.8);
+  c.restore();
+}
+
+// Records the whole story (erasing intro + mapping + before/after) off-screen:
+// the picture on screen does not replay, the button shows progress.
 let recording = false;
 function saveVideo() {
   if (recording) return;
@@ -1957,27 +2077,35 @@ function saveVideo() {
   const rc = document.createElement('canvas');
   rc.width = W; rc.height = H;
   const rctx = rc.getContext('2d');
-  renderIntro(rctx, 0);
-  const stream = rc.captureStream(30);
-  const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 6_000_000 });
+  const [OW, OH] = exportSize();
+  const comp = makeComposer(OW, OH);
+  let cap = '';
+  const onCaption = (txt) => { cap = txt; };
+  renderIntro(rctx, 0, { onCaption }); comp.frame(rc, cap);
+  const stream = comp.canvas.captureStream(30);
+  const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 10_000_000 });
   const chunks = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   const labelEl = $('saveVidLabel');
-  const total = INTRO + state.timeline.end + 1.2;
+  const main = state.timeline.end;
+  const total = INTRO + main + 0.6 + OUTRO;
   recording = true;
   els.saveVid.disabled = true;
   rec.onstop = () => {
     recording = false;
     els.saveVid.disabled = false;
     labelEl.textContent = tr('Save animation');
-    download(new Blob(chunks, { type }), `brow-mapping.${type.includes('mp4') ? 'mp4' : 'webm'}`);
+    download(new Blob(chunks, { type }), `brow-mapping-${els.format.value.replace(':', 'x')}.${type.includes('mp4') ? 'mp4' : 'webm'}`);
   };
   rec.start();
   const t0 = performance.now();
   const frame = (now) => {
     const t = (now - t0) / 1000;
-    if (t < INTRO) renderIntro(rctx, t);
-    else render(Math.min(t - INTRO, state.timeline.end), rctx, { burnCaption: true });
+    cap = '';
+    if (t < INTRO) renderIntro(rctx, t, { onCaption });
+    else if (t < INTRO + main + 0.6) render(Math.min(t - INTRO, main), rctx, { onCaption });
+    else { renderOutro(rctx, t - INTRO - main - 0.6); cap = ''; }
+    comp.frame(rc, cap);
     labelEl.textContent = `${tr('Saving…')} ${Math.min(99, Math.round(t / total * 100))}%`;
     if (t < total) requestAnimationFrame(frame);
     else rec.stop();
@@ -1986,6 +2114,26 @@ function saveVideo() {
 }
 
 /* ------------------------------ UI wiring ------------------------------ */
+
+// export settings: format and optional logo (remembered on this device)
+try { const f = localStorage.getItem('brow-format'); if (f && [...els.format.options].some((o) => o.value === f)) els.format.value = f; } catch {}
+els.format.addEventListener('change', () => { try { localStorage.setItem('brow-format', els.format.value); } catch {} });
+function setLogo(img, dataUrl) {
+  exportLogo.img = img;
+  $('logoPreview').hidden = !img;
+  $('logoRemove').hidden = !img;
+  if (img) $('logoPreview').src = dataUrl;
+  try { if (dataUrl) localStorage.setItem('brow-logo', dataUrl); else localStorage.removeItem('brow-logo'); } catch {}
+}
+$('logoFile').addEventListener('change', () => {
+  const f = $('logoFile').files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { const i = new Image(); i.onload = () => setLogo(i, r.result); i.src = r.result; };
+  r.readAsDataURL(f);
+});
+$('logoRemove').addEventListener('click', () => { $('logoFile').value = ''; setLogo(null, null); });
+try { const d = localStorage.getItem('brow-logo'); if (d) { const i = new Image(); i.onload = () => setLogo(i, d); i.src = d; } } catch {}
 
 // language
 $('lang').addEventListener('click', () => setLang(getLang() === 'he' ? 'en' : 'he'));
