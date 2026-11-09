@@ -1380,7 +1380,9 @@ function burnCaption(c, text) {
  * the face mesh twinkling in and particles rising while each brow fades away.
  * Fully deterministic (same video every time).
  * ----------------------------------------------------------------------------------------- */
-const INTRO = 4.2;
+// the mapping animation plays at this speed (lower = slower, more time to read each step)
+const ANIM_SPEED = 0.62;
+const INTRO = 5;
 let introCache = null;
 function introParticles() {
   if (introCache && introCache.key === state.browInfo) return introCache.list;
@@ -1401,6 +1403,7 @@ function introParticles() {
   return list;
 }
 function renderIntro(c, t, opts = {}) {
+  t = t * 4.2 / INTRO; // designed for 4.2 s, played over INTRO s
   const { W, H, face } = state;
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.clearRect(0, 0, W, H);
@@ -1416,7 +1419,7 @@ function renderIntro(c, t, opts = {}) {
     c.restore();
   }
   const unit = face.eyeW;
-  const fade = 1 - smooth((t - (INTRO - 0.6)) / 0.6);   // effects fade out at the end
+  const fade = 1 - smooth((t - 3.6) / 0.6);   // effects fade out at the end
   c.fillStyle = `rgba(18,14,13,${(0.16 * fade).toFixed(3)})`;
   c.fillRect(0, 0, W, H);
   // scanning beam
@@ -1460,7 +1463,7 @@ function play(onDone) {
   els.replay.disabled = true;
   const tick = (now) => {
     if (!state.playing) return;
-    state.t = (now - state.start) / 1000;
+    state.t = (now - state.start) / 1000 * ANIM_SPEED;
     render(state.t);
     if (state.t >= state.timeline.end) {
       state.playing = false;
@@ -2090,27 +2093,37 @@ function makeComposer(OW, OH) {
   };
 }
 
-// before | after split on the work canvas (t: seconds into the outro)
+// before | after split on the work canvas (t: seconds into the outro).
+// The split follows the face's own vertical axis through the nose (tilted
+// with the head), and the labels sit at the bottom so a logo never covers them.
 function renderOutro(c, t) {
-  const { W, H } = state;
+  const { W, H, face } = state;
   render(state.timeline.end, c, { onCaption: () => {} });
-  const after = document.createElement('canvas'); after.width = W; after.height = H;
-  after.getContext('2d').drawImage(c.canvas, 0, 0);
-  const x = lerp(W, W / 2, smooth(t / 0.9));
+  // face axis: through the bridge (168) and the nose tip (1), perpendicular to the eye line
+  const top = face.P[168], tip = face.P[1];
+  const ang = face.angle; // head roll
+  const ux = -Math.sin(ang), uy = Math.cos(ang); // face "down" direction
+  const cx = (top.x + tip.x) / 2, cy = (top.y + tip.y) / 2;
+  const xAt = (y) => cx + (y - cy) * ux / uy;   // x of the axis at height y
+  const shift = lerp(W * 1.2, 0, smooth(t / 0.9)); // wipe in from the right
+  const xTop = xAt(0) + shift, xBot = xAt(H) + shift;
   c.save();
   c.setTransform(1, 0, 0, 1, 0, 0);
-  c.beginPath(); c.rect(0, 0, x, H); c.clip();
+  c.beginPath(); c.moveTo(0, 0); c.lineTo(xTop, 0); c.lineTo(xBot, H); c.lineTo(0, H); c.closePath(); c.clip();
   c.drawImage(state.orig, 0, 0);
   c.restore();
   c.save();
-  c.fillStyle = '#fff'; c.fillRect(x - Math.max(1.5, W * 0.003), 0, Math.max(3, W * 0.006), H);
-  const a = smooth((t - 0.8) / 0.4), size = Math.round(Math.min(W, H) * 0.045);
+  c.strokeStyle = '#fff'; c.lineWidth = Math.max(3, W * 0.006);
+  c.shadowColor = 'rgba(0,0,0,0.4)'; c.shadowBlur = c.lineWidth * 2;
+  c.beginPath(); c.moveTo(xTop, 0); c.lineTo(xBot, H); c.stroke();
+  const a = smooth((t - 0.8) / 0.4), size = Math.round(Math.min(W, H) * 0.05);
   c.globalAlpha = a;
   c.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
-  c.textBaseline = 'top'; c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = size * 0.4;
-  c.textAlign = 'center';
-  c.fillText(tr('Before'), W * 0.25, size * 0.8);
-  c.fillText(tr('After'), W * 0.75, size * 0.8);
+  c.textBaseline = 'bottom'; c.shadowBlur = size * 0.5; c.shadowColor = 'rgba(0,0,0,0.7)';
+  c.fillStyle = '#fff'; c.textAlign = 'center';
+  const ly = H - size * 0.9, xm = xAt(ly);
+  c.fillText(tr('Before'), xm / 2, ly);
+  c.fillText(tr('After'), xm + (W - xm) / 2, ly);
   c.restore();
 }
 
@@ -2136,7 +2149,7 @@ function saveVideo() {
   const chunks = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   const labelEl = $('saveVidLabel');
-  const main = state.timeline.end;
+  const main = state.timeline.end / ANIM_SPEED; // seconds of video
   const total = INTRO + main + 0.6 + OUTRO;
   recording = true;
   els.saveVid.disabled = true;
@@ -2152,7 +2165,7 @@ function saveVideo() {
     const t = (now - t0) / 1000;
     cap = '';
     if (t < INTRO) renderIntro(rctx, t, { onCaption });
-    else if (t < INTRO + main + 0.6) render(Math.min(t - INTRO, main), rctx, { onCaption });
+    else if (t < INTRO + main + 0.6) render(Math.min((t - INTRO) * ANIM_SPEED, state.timeline.end), rctx, { onCaption });
     else { renderOutro(rctx, t - INTRO - main - 0.6); cap = ''; }
     comp.frame(rc, cap);
     labelEl.textContent = `${tr('Saving…')} ${Math.min(99, Math.round(t / total * 100))}%`;
