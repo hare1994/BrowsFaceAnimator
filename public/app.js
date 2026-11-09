@@ -442,6 +442,24 @@ function ownBrowBottom(face) {
   return vals[vals.length >> 1] - eyeW * 0.03;
 }
 
+// How far out her real brow reaches (face frame, half-distance from the centre),
+// averaged over both sides. null when there is no mask.
+function ownBrowOuterHalf(face) {
+  const b = state.browInfo;
+  if (!b) return null;
+  const { mask, bx0, by0, bw, bh } = b;
+  let maxL = 0, maxR = 0;
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    if (!mask[y * bw + x]) continue;
+    const q = face.F(pt(x + bx0, y + by0));
+    const h = q.x - face.midX;
+    if (h < 0) maxL = Math.max(maxL, -h); else maxR = Math.max(maxR, h);
+  }
+  if (!maxL || !maxR) return null;
+  // the mask reaches a little past the hairs
+  return (maxL + maxR) / 2 - face.eyeW * 0.03;
+}
+
 function mapBrows(face, s) {
   const { midX, eyeY, eyeW } = face;
 
@@ -478,7 +496,22 @@ function mapBrows(face, s) {
   // strict corner line (too short) and the reel's line (too long)
   const slope = (face.outerHalf + 0.105 * eyeW - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
   const tailHalfIdeal = ax + slope * (ay - tailY);
-  const tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
+  let tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
+  // Brows set very low (close to the eye) and naturally long: draw them a
+  // touch longer (up to +5%, never past where her own brow ended). All other
+  // faces are untouched (weight 0 when the brow sits 0.21+ eye-widths up).
+  {
+    const low = (eyeY - ownBot) / eyeW;
+    const wLow = measured != null ? smooth((0.21 - low) / 0.05) : 0;
+    const reach = ownBrowOuterHalf(face);
+    if (wLow > 0 && reach != null && reach > tailHalf) {
+      tailHalf = Math.min(reach, tailHalf + (tailHalf - innerHalf) * 0.05 * wLow);
+    }
+  }
+  if (window.__brow) window.__brow.metrics = {
+    low: +((eyeY - ownBot) / eyeW).toFixed(3),
+    tailHalf: +tailHalf.toFixed(2), tailHalfIdeal: +(innerHalf + (tailHalfIdeal - innerHalf) * s.tail).toFixed(2),
+  };
   // 2) arch (standard mapping): straight above the outer edge of the iris,
   //    which lands about two-thirds along the brow
   const irisEdge = face.irisHalf + face.irisRad;
