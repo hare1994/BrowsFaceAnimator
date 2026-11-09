@@ -504,11 +504,15 @@ function mapBrows(face, s) {
   // 3) tail (standard mapping): the straight line from the outer edge of the
   //    nostril through (just past) the outer corner of the eye, at tail height
   //    (tail sits a little above the head, never lower)
-  const tailY = innerBotY - 0.06 * eyeW;
+  // the tail tip ends level with the bottom of the brow head (never lower);
+  // its length is measured on the tail line slightly higher, which keeps the
+  // length you approved
+  const tailLenY = innerBotY - 0.06 * eyeW;
+  const tailY = innerBotY;
   // the line clears the eye corner by ~0.1 eye-widths: halfway between the
   // strict corner line (too short) and the reel's line (too long)
   const slope = (face.outerHalf + 0.105 * eyeW - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
-  const tailHalfIdeal = ax + slope * (ay - tailY);
+  const tailHalfIdeal = ax + slope * (ay - tailLenY);
   let tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
   // Brows set very low (close to the eye) and naturally long: draw them a
   // touch longer (up to +5%, never past where her own brow ended). All other
@@ -525,11 +529,12 @@ function mapBrows(face, s) {
     low: +((eyeY - ownBot) / eyeW).toFixed(3),
     tailHalf: +tailHalf.toFixed(2), tailHalfIdeal: +(innerHalf + (tailHalfIdeal - innerHalf) * s.tail).toFixed(2),
   };
-  // 2) arch (standard mapping): straight above the outer edge of the iris,
-  //    which lands about two-thirds along the brow
-  const irisEdge = face.irisHalf + face.irisRad;
-  const archHalf = clamp(irisEdge * s.arch, innerHalf + (tailHalf - innerHalf) * 0.5, innerHalf + (tailHalf - innerHalf) * 0.8);
-  const archSlope = (archHalf - ax) / Math.max(1, ay - archTopY);
+  // 2) arch (standard mapping, as in the reference reel): the line from the
+  //    nostril edge through the centre of the pupil, where it reaches the
+  //    arch height (about two-thirds along the brow)
+  const archSlope = (face.irisHalf - ax) / Math.max(1, ay - eyeY);
+  const archLine = ax + archSlope * (ay - archTopY);
+  const archHalf = clamp(innerHalf + (archLine - innerHalf) * s.arch, innerHalf + (tailHalf - innerHalf) * 0.5, innerHalf + (tailHalf - innerHalf) * 0.8);
 
   const sides = [-1, 1].map((sg) => {
     const X = (h) => midX + sg * h;
@@ -844,10 +849,12 @@ function buildTimeline(face, geo) {
   add({ color: COLORS.yellow, a: pt(midX - short, geo.innerTopY), b: pt(midX + short, geo.innerTopY), t0: 4.1, d: 0.6, fromCenter: true });
   add({ color: COLORS.yellow, a: pt(midX - short, geo.innerBotY), b: pt(midX + short, geo.innerBotY), t0: 4.6, d: 0.6, fromCenter: true });
   add({ color: COLORS.yellow, a: pt(midX - longHalf, geo.archTopY), b: pt(midX + longHalf, geo.archTopY), t0: 5.2, d: 0.8, fromCenter: true });
-  // white: arch verticals through the outer iris
+  // white: arch lines, from the nostril edge through the centre of the pupil
   for (const sg of [-1, 1]) {
-    const x = midX + sg * geo.archHalf;
-    add({ color: COLORS.white, a: pt(x, geo.archTopY - eyeW * 0.6), b: pt(x, face.nostrilY + eyeW * 0.25), t0: 6.1 + (sg > 0 ? 0.3 : 0), d: 0.8, tip: true });
+    const ax = midX + sg * face.noseHalf, ay = face.nostrilY;
+    const ey = geo.archTopY - eyeW * 0.12;
+    const ex = midX + sg * (face.noseHalf + geo.archSlope * (ay - ey));
+    add({ color: COLORS.white, a: pt(ax, ay), b: pt(ex, ey), t0: 6.1 + (sg > 0 ? 0.3 : 0), d: 0.8, tip: true });
   }
   // white: diagonals nostril -> outer eye corner -> tail
   for (const sg of [-1, 1]) {
@@ -881,7 +888,7 @@ function buildTimeline(face, geo) {
       [1.8, 'Centre line'],
       [2.8, 'Start: inner nose line, straight up'],
       [4.1, 'Brow height'],
-      [6.1, 'Arch: above the outer edge of the iris'],
+      [6.1, 'Arch: nose line through the pupil'],
       [7.2, 'Tail: nostril past the outer eye corner'],
       [9.4, 'Mapping points'],
       [10.3, 'Connecting the shape'],

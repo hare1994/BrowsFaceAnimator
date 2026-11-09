@@ -55,7 +55,7 @@ const HE = {
   'Centre line': 'קו האמצע',
   'Start: inner nose line, straight up': 'תחילת הגבה: קו ישר מצד האף',
   'Brow height': 'גובה הגבה',
-  'Arch: above the outer edge of the iris': 'הקשת: מעל הקצה החיצוני של הקשתית',
+  'Arch: nose line through the pupil': 'הקשת: קו מכנף האף דרך מרכז האישון',
   'Tail: nostril past the outer eye corner': 'הזנב: מכנף האף, מעבר לזווית העין',
   'Mapping points': 'נקודות המיפוי',
   'Connecting the shape': 'מחברים את הצורה',
