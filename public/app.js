@@ -984,7 +984,18 @@ function busyStage(text, from, to, ms, subs = []) {
   busy.subs = subs; busy.subIdx = -1; busy.subT = 0;
   busyEls.text.textContent = text;
 }
-function busySetImage(canvas) { busy.next = canvas; busy.fadeStart = performance.now(); }
+function busySetImage(canvas) {
+  // if a fade is still running, freeze what is on screen right now as the new
+  // starting point, so the picture never jumps back to an older frame
+  if (busy.next && busy.base) {
+    const a = smooth((performance.now() - busy.fadeStart) / 700);
+    const mid = makeCanvas(state.W, state.H), g = mid.getContext('2d');
+    g.drawImage(busy.base, 0, 0);
+    g.globalAlpha = a; g.drawImage(busy.next, 0, 0);
+    busy.base = mid;
+  }
+  busy.next = canvas; busy.fadeStart = performance.now();
+}
 function busySetFace(face) { busy.face = face; busy.faceT = performance.now(); }
 function busySetBrow(brow, face) {
   const pts = [];
