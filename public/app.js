@@ -425,6 +425,12 @@ function settings() {
 function ownBrowBottom(face) {
   const b = state.browInfo;
   if (!b) return null;
+  // depends only on the photo: computed once per photo
+  const memo = (b._memo = b._memo || {});
+  if ('ownBrowBottom' in memo) return memo['ownBrowBottom'];
+  return (memo['ownBrowBottom'] = ownBrowBottomCalc(face, b));
+}
+function ownBrowBottomCalc(face, b) {
   const { mask, bx0, by0, bw, bh } = b;
   const { midX, eyeW } = face;
   const h0 = Math.min(face.noseHalf, face.innerCornerHalf) * 0.8;
@@ -448,6 +454,12 @@ function ownBrowBottom(face) {
 function ownBrowOuterHalf(face) {
   const b = state.browInfo;
   if (!b) return null;
+  // depends only on the photo: computed once per photo
+  const memo = (b._memo = b._memo || {});
+  if ('ownBrowOuterHalf' in memo) return memo['ownBrowOuterHalf'];
+  return (memo['ownBrowOuterHalf'] = ownBrowOuterHalfCalc(face, b));
+}
+function ownBrowOuterHalfCalc(face, b) {
   const { mask, bx0, by0, bw, bh } = b;
   let maxL = 0, maxR = 0;
   for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
@@ -1048,7 +1060,11 @@ function drawTri(g, img, s0, s1, s2, d0, d1, d2) {
   const e = (d0.x * (s1.x * s2.y - s2.x * s1.y) + d1.x * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / den;
   const f = (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.y * (s0.x * s1.y - s1.x * s0.y)) / den;
   g.transform(a, b, c, d, e, f);
-  g.drawImage(img, 0, 0);
+  // copy only the part of the template under this triangle (not the whole image)
+  const iw = img.width, ih = img.height;
+  const sx0 = Math.max(0, Math.floor(Math.min(s0.x, s1.x, s2.x)) - 2), sy0 = Math.max(0, Math.floor(Math.min(s0.y, s1.y, s2.y)) - 2);
+  const sx1 = Math.min(iw, Math.ceil(Math.max(s0.x, s1.x, s2.x)) + 2), sy1 = Math.min(ih, Math.ceil(Math.max(s0.y, s1.y, s2.y)) + 2);
+  if (sx1 > sx0 && sy1 > sy0) g.drawImage(img, sx0, sy0, sx1 - sx0, sy1 - sy0, sx0, sy0, sx1 - sx0, sy1 - sy0);
   g.restore();
 }
 
@@ -1056,7 +1072,9 @@ function drawTri(g, img, s0, s1, s2, d0, d1, d2) {
 function drawNaturalBrows(g, geo, face, hex, reveal, opacity = state.browOpacity || 1) {
   const meta = browTpl.meta;
   const [tpl, tplMirror] = tintedTemplate(hex);
-  const NU = 40, VS = [-0.45, 0, 0.25, 0.5, 0.75, 1, 1.45];
+  // coarser mesh while a slider is being dragged (full detail on release)
+  const NU = state.dragging ? 16 : 40;
+  const VS = state.dragging ? [-0.45, 0, 0.5, 1, 1.45] : [-0.45, 0, 0.25, 0.5, 0.75, 1, 1.45];
   const span = geo.tailHalf - geo.innerHalf;
   const tS = (u) => { const f = u * 64, i = Math.min(63, Math.floor(f)), t = f - i; return [lerp(meta.top[i], meta.top[i + 1], t), lerp(meta.bot[i], meta.bot[i + 1], t)]; };
   for (const side of geo.sides) {
@@ -1093,6 +1111,98 @@ function drawNaturalBrows(g, geo, face, hex, reveal, opacity = state.browOpacity
   }
 }
 
+
+/* ------------------------------ GPU (WebGL) brow warping ------------------------------
+ * Same mesh as drawNaturalBrows, drawn on the GPU: one draw call instead of
+ * hundreds of clipped canvas copies, so sliders stay smooth on phones.
+ * Falls back to the canvas version if WebGL is unavailable.
+ * --------------------------------------------------------------------------------------- */
+const glw = { cv: null, gl: null, prog: null, buf: null, tex: null, texKey: null, ok: null, mip: false };
+function glInit() {
+  if (glw.ok !== null) return glw.ok;
+  try {
+    const cv = document.createElement('canvas');
+    const opts = { premultipliedAlpha: true, preserveDrawingBuffer: true, antialias: true, alpha: true };
+    let gl = cv.getContext('webgl2', opts), v2 = true;
+    if (!gl) { gl = cv.getContext('webgl', opts); v2 = false; }
+    if (!gl) { glw.ok = false; return false; }
+    const sh = (type, src) => { const x = gl.createShader(type); gl.shaderSource(x, src); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x; };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, `
+      attribute vec2 p; attribute vec2 uv; attribute float a;
+      uniform vec2 size; varying vec2 vuv; varying float va;
+      void main() { vuv = uv; va = a; gl_Position = vec4(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, 0.0, 1.0); }`));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, `
+      precision mediump float; uniform sampler2D tex; varying vec2 vuv; varying float va;
+      void main() { gl_FragColor = texture2D(tex, vuv) * va; }`));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    Object.assign(glw, { cv, gl, prog, buf: gl.createBuffer(), tex: gl.createTexture(), mip: v2, ok: true });
+  } catch (e) { console.warn('WebGL brows unavailable', e); glw.ok = false; }
+  return glw.ok;
+}
+
+// draws both brows into glw.cv (size w x h); toPx maps a face-frame point to that canvas
+function drawNaturalBrowsGL(w, h, toPx, geo, face, hex, reveal, opacity) {
+  const { gl } = glw;
+  const meta = browTpl.meta;
+  const tpl = tintedTemplate(hex)[0];
+  if (glw.texKey !== tpl) {
+    gl.bindTexture(gl.TEXTURE_2D, glw.tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tpl);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    if (glw.mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    glw.texKey = tpl;
+  }
+  const NU = 40, VS = [-0.45, 0, 0.25, 0.5, 0.75, 1, 1.45];
+  const span = geo.tailHalf - geo.innerHalf;
+  const tS = (u) => { const f = u * 64, i = Math.min(63, Math.floor(f)), t = f - i; return [lerp(meta.top[i], meta.top[i + 1], t), lerp(meta.bot[i], meta.bot[i + 1], t)]; };
+  const data = [];
+  for (const side of geo.sides) {
+    const { topB, botB, BINS } = browEdges(side, geo, face);
+    const tE = (u) => { const f = u * BINS, i = Math.min(BINS - 1, Math.floor(f)), t = f - i; return [lerp(topB[i], topB[i + 1], t), lerp(botB[i], botB[i + 1], t)]; };
+    const vert = (u, v, al) => {
+      const [t, b] = tS(u);
+      // the mirrored template at (w - x) is the original at x: no flip needed
+      const sx = lerp(meta.headX, meta.tailX, u), sy = b - v * (b - t);
+      const [dt, db] = tE(u);
+      const P = toPx(pt(face.midX + side.sg * (geo.innerHalf + u * span), db - v * (db - dt)));
+      data.push(P.x, P.y, sx / meta.w, sy / meta.h, al);
+    };
+    for (let i = 0; i < NU; i++) {
+      const u0 = i / NU, u1 = (i + 1) / NU;
+      const a0 = smooth((reveal * 1.35 - u0) / 0.35) * opacity, a1 = smooth((reveal * 1.35 - u1) / 0.35) * opacity;
+      if (a0 <= 0 && a1 <= 0) break;
+      for (let j = 0; j < VS.length - 1; j++) {
+        const v0 = VS[j], v1 = VS[j + 1];
+        vert(u0, v0, a0); vert(u1, v0, a1); vert(u1, v1, a1);
+        vert(u0, v0, a0); vert(u1, v1, a1); vert(u0, v1, a0);
+      }
+    }
+  }
+  if (glw.cv.width !== w || glw.cv.height !== h) { glw.cv.width = w; glw.cv.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!data.length) return glw.cv;
+  gl.useProgram(glw.prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, glw.buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.DYNAMIC_DRAW);
+  const loc = (n) => gl.getAttribLocation(glw.prog, n);
+  gl.enableVertexAttribArray(loc('p')); gl.vertexAttribPointer(loc('p'), 2, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(loc('uv')); gl.vertexAttribPointer(loc('uv'), 2, gl.FLOAT, false, 20, 8);
+  gl.enableVertexAttribArray(loc('a')); gl.vertexAttribPointer(loc('a'), 1, gl.FLOAT, false, 20, 16);
+  gl.uniform2f(gl.getUniformLocation(glw.prog, 'size'), w, h);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, glw.tex);
+  gl.uniform1i(gl.getUniformLocation(glw.prog, 'tex'), 0);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.TRIANGLES, 0, data.length / 5);
+  return glw.cv;
+}
+
 function drawBrows(c, progress) {
   if (progress <= 0) return;
   const s = settings();
@@ -1104,7 +1214,7 @@ function drawBrows(c, progress) {
     // photo-real: drawn only in a box around the brows, at 2x (1x while a
     // slider is being dragged), and redrawn only when something changed
     const { W, H } = state;
-    const SS = state.dragging ? 1 : Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
+    const SS = state.dragging && !glw.ok ? 1 : Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
     const reveal = clamp(progress * 1.08);
     let box = natLayer.boxFor === geo ? natLayer.box : null;
     if (!box) {
@@ -1124,6 +1234,16 @@ function drawBrows(c, progress) {
       const cv = natLayer.cv;
       if (cv.width !== box.w * SS || cv.height !== box.h * SS) { cv.width = box.w * SS; cv.height = box.h * SS; }
       const g = cv.getContext('2d');
+      if (glInit()) {
+        // GPU path: warp on the GPU, then one copy into the cached layer
+        const { C, angle } = state.face, ca = Math.cos(angle), sa = Math.sin(angle);
+        const toPx = (q) => pt((C.x + (q.x - C.x) * ca - (q.y - C.y) * sa - box.x0) * SS, (C.y + (q.x - C.x) * sa + (q.y - C.y) * ca - box.y0) * SS);
+        const out = drawNaturalBrowsGL(cv.width, cv.height, toPx, geo, state.face, s.color, reveal, state.browOpacity || 1);
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.clearRect(0, 0, cv.width, cv.height);
+        g.drawImage(out, 0, 0);
+        natLayer.key = geo; natLayer.color = s.color; natLayer.reveal = reveal; natLayer.op = state.browOpacity; natLayer.ss = SS;
+      } else {
       g.setTransform(1, 0, 0, 1, 0, 0);
       g.clearRect(0, 0, cv.width, cv.height);
       g.save();
@@ -1133,10 +1253,12 @@ function drawBrows(c, progress) {
       drawNaturalBrows(g, geo, state.face, s.color, reveal);
       g.restore();
       natLayer.key = geo; natLayer.color = s.color; natLayer.reveal = reveal; natLayer.op = state.browOpacity; natLayer.ss = SS;
+      }
     }
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
-    c.imageSmoothingQuality = 'high';
+    if (SS === 1) c.imageSmoothingEnabled = false; // 1:1 copy, no filtering needed
+    else c.imageSmoothingQuality = 'high';
     c.drawImage(natLayer.cv, box.x0, box.y0, box.w, box.h);
     c.restore();
     return;
@@ -1257,9 +1379,10 @@ function render(t, c = ctx, opts = {}) {
   }
 
   // 1. brow removal: a scan sweeps down, revealing the cleaned photo
-  c.drawImage(state.orig, 0, 0);
   const rp = smooth((t - tl.removeStart) / (tl.removeEnd - tl.removeStart));
-  if (rp > 0) {
+  if (rp < 1) c.drawImage(state.orig, 0, 0);
+  if (rp >= 1) c.drawImage(state.clean, 0, 0);
+  else if (rp > 0) {
     c.save();
     c.globalAlpha = rp;
     c.drawImage(state.clean, 0, 0);
@@ -1452,12 +1575,46 @@ function scheduleRebuild() {
   requestAnimationFrame(() => { rebuildQueued = false; rebuild(); });
 }
 
+// image-space box around both brows (with margin)
+function browsBox(geo, pad) {
+  const { W, H } = state;
+  let x0 = W, y0 = H, x1 = 0, y1 = 0;
+  for (const side of geo.sides) for (const q of side.outline) {
+    const p = faceToImage(q);
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+  }
+  x0 = Math.max(0, Math.floor(x0 - pad)); y0 = Math.max(0, Math.floor(y0 - pad));
+  x1 = Math.min(W, Math.ceil(x1 + pad)); y1 = Math.min(H, Math.ceil(y1 + pad));
+  return { x0, y0, x1, y1 };
+}
+
 function rebuild() {
   if (!state.face) return;
+  const prev = state.brows;
   state.brows = mapBrows(state.face, settings());
   state.timeline = buildTimeline(state.face, state.brows);
-  if (!state.playing) render(state.timeline.end);
-  showMeasurements();
+  if (!state.playing) {
+    const atEnd = state.t >= state.timeline.end - 1e-6;
+    if (atEnd && prev && !state.showOriginal) {
+      // final frame only changes around the brows: repaint just that area
+      const pad = state.face.eyeW * 0.6;
+      const a = browsBox(prev, pad), b = browsBox(state.brows, pad);
+      const x0 = Math.min(a.x0, b.x0), y0 = Math.min(a.y0, b.y0), x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.beginPath(); ctx.rect(x0, y0, x1 - x0, y1 - y0); ctx.clip();
+      ctx.drawImage(state.clean, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+      drawBrows(ctx, 1);
+      ctx.restore();
+    } else render(state.timeline.end);
+  }
+  scheduleMeasurements();
+}
+// the measurement table is not needed on every slider frame
+let measureTimer = 0;
+function scheduleMeasurements() {
+  clearTimeout(measureTimer);
+  measureTimer = setTimeout(showMeasurements, state.dragging ? 150 : 0);
 }
 
 function showMeasurements() {
