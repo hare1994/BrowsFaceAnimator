@@ -199,10 +199,12 @@ function removeBrows(src, face) {
     const onMsg = (e) => {
       if (e.data.id !== id) return;
       remWorker.removeEventListener('message', onMsg);
+      remWorker.removeEventListener('error', onErr);
       if (e.data.ok) resolve(finish(e.data.r)); else reject(new Error(e.data.error));
     };
     remWorker.addEventListener('message', onMsg);
-    remWorker.addEventListener('error', () => { try { resolve(inline()); } catch (er) { reject(er); } }, { once: true });
+    const onErr = () => { remWorker.removeEventListener('message', onMsg); try { resolve(inline()); } catch (er) { reject(er); } };
+    remWorker.addEventListener('error', onErr, { once: true });
     const copy = new Uint8ClampedArray(d);
     remWorker.postMessage({ id, d: copy, W, H, P, eyeW: face.eyeW }, [copy.buffer]);
   });
@@ -250,7 +252,16 @@ function getMigan() {
 }
 
 // Repaints the brow mask with MI-GAN, one brow at a time.
-async function aiRemoveBrows(src, brow, face, onStep = () => {}) {
+class AbortError extends Error { constructor() { super('cancelled'); this.name = 'AbortError'; } }
+// the model must never run twice at the same time: queue every call
+let modelQueue = Promise.resolve();
+function runModel(session, feeds) {
+  const job = modelQueue.then(() => session.run(feeds));
+  modelQueue = job.catch(() => {});
+  return job;
+}
+
+async function aiRemoveBrows(src, brow, face, onStep = () => {}, alive = () => true) {
   const { W, H } = state;
   const { mask, bx0, by0, bw, bh } = brow;
   const session = await getMigan();
@@ -281,10 +292,15 @@ async function aiRemoveBrows(src, brow, face, onStep = () => {}) {
       chw[j] = d[k * 4]; chw[n + j] = d[k * 4 + 1]; chw[2 * n + j] = d[k * 4 + 2];
     }
     await yieldFrame();
-    const out = await session.run({
+    if (!alive()) throw new AbortError();
+    const feeds = () => ({
       image: new ort.Tensor('uint8', chw, [1, 3, ch, cw]),
       mask: new ort.Tensor('uint8', known, [1, 1, ch, cw]),
     });
+    let out;
+    try { out = await runModel(session, feeds()); }
+    catch (e) { console.warn('AI step failed, retrying once', e); out = await runModel(session, feeds()); }
+    if (!alive()) throw new AbortError();
     await yieldFrame();
     const r = out.result.data;
     // composite with a 1 px soft edge
@@ -312,7 +328,7 @@ async function aiRemoveBrows(src, brow, face, onStep = () => {}) {
   onStep('done', 1, snapshot());
   onStep('polish');
   // safety pass: hair-like dark specks left (or invented) inside the brow area
-  for (let pass = 0; pass < 2; pass++) {
+  try { for (let pass = 0; pass < 2; pass++) {
     const Lr = new Float32Array(bw * bh);
     for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
       const k = ((y + by0) * W + (x + bx0)) * 4;
@@ -328,6 +344,9 @@ async function aiRemoveBrows(src, brow, face, onStep = () => {}) {
     const sm = dilateMask(spots, bw, bh, Math.max(2, Math.round(face.eyeW * 0.03)));
     await runMask((x, y) => sm[y * bw + x] && x < midX);
     await runMask((x, y) => sm[y * bw + x] && x >= midX);
+  } } catch (e) {
+    if (e instanceof AbortError) throw e;
+    console.warn('polish pass failed; keeping the erased result', e);
   }
   const result = makeCanvas(W, H);
   result.getContext('2d').putImageData(img, 0, 0);
@@ -1003,11 +1022,12 @@ function busySetBrow(brow, face) {
   for (let k = 0; k < mask.length; k += 3) if (mask[k]) pts.push([(k % bw) + bx0, ((k / bw) | 0) + by0]);
   busy.spawn = pts; busy.midX = face.midX;
 }
-function busyFinish() {
+function busyFinish(alive = () => true) {
   return new Promise((resolve) => {
     busyStage('Done', busy.shown, 1, 250);
     busy.to = 1; busy.from = 1;
     setTimeout(() => {
+      if (!alive()) { resolve(); return; }
       busyEls.box.hidden = true;
       busy.on = false;
       cancelAnimationFrame(busy.raf);
@@ -1123,8 +1143,12 @@ function setStatus(msg, error = false) {
   els.status.classList.toggle('error', error);
 }
 
+let loadRun = 0;
 async function loadFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
+  // a newer photo cancels any run still in progress
+  const myRun = ++loadRun;
+  const alive = () => myRun === loadRun;
   state.playing = false;
   document.documentElement.dataset.browState = 'loading';
   els.intro.hidden = true;
@@ -1144,6 +1168,7 @@ async function loadFile(file) {
       img.src = URL.createObjectURL(file);
     });
   }
+  if (!alive()) return;
   const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
   const W = Math.round(bmp.width * scale), H = Math.round(bmp.height * scale);
   state.W = W; state.H = H;
@@ -1160,8 +1185,10 @@ async function loadFile(file) {
     const migan = getMigan().catch((e) => { throw e; });
     migan.catch(() => {});
     const lmk = await getLandmarker();
+    if (!alive()) return;
     busyStage('Finding her face', 0.1, 0.18, 500, ['Locating 478 face points']);
     await new Promise((r) => setTimeout(r, 60));
+    if (!alive()) return;
     const res = lmk.detect(orig);
     if (!res.faceLandmarks || !res.faceLandmarks.length) {
       busyFail();
@@ -1173,10 +1200,14 @@ async function loadFile(file) {
     busySetFace(state.face);
     busyStage('Mapping brow hairs', 0.18, 0.26, 600, ['Tracing every hair', 'Protecting lids and eyeshadow']);
     await new Promise((r) => setTimeout(r, 450));
-    const { canvas, hair, brow } = await removeBrows(orig, state.face);
+    if (!alive()) return;
+    const face = state.face;
+    const { canvas, hair, brow } = await removeBrows(orig, face);
+    if (!alive()) return;
     state.clean = canvas;
     busySetBrow(brow, state.face);
     // AI repaint (better skin, shading and texture); the classic fill stays as fallback
+    let aiFailed = false;
     const sideMs = busyTimes.side;
     try {
       let from = 0.26;
@@ -1184,15 +1215,18 @@ async function loadFile(file) {
         busyStage('Downloading the skin AI', 0.26, 0.42, 1000, ['One-time download (~28 MB)', 'Saved on this device for next time']);
         busy.dl = true;
         await migan;
+        if (!alive()) return;
         busy.dl = false;
         from = 0.42;
       }
       busyStage('Erasing brow 1 of 2', from, 0.58, sideMs + 800, ['Rebuilding the skin underneath', 'Matching skin tone', 'Recreating pores and texture']);
       busy.side = 0;
       await migan;
+      if (!alive()) return;
       const t0 = performance.now();
       let tSide = t0;
-      state.clean = await aiRemoveBrows(orig, brow, state.face, (step, side, snap) => {
+      const aiResult = await aiRemoveBrows(orig, brow, face, (step, side, snap) => {
+        if (!alive()) return;
         if (step === 'side' && side === 1) {
           busyStage('Erasing brow 2 of 2', 0.58, 0.86, busyTimes.side, ['Blending with the forehead', 'Keeping the eyelid untouched', 'Softening the edges']);
           busy.side = 1;
@@ -1203,23 +1237,31 @@ async function loadFile(file) {
           busyStage('Polishing', 0.86, 0.97, busyTimes.side * 1.5, ['Checking for any leftover hairs']);
           busy.side = 2;
         }
-      });
+      }, alive);
+      if (!alive()) return;
+      state.clean = aiResult;
       if (window.__brow) window.__brow.aiMs = Math.round(performance.now() - t0);
     } catch (e) {
+      if (!alive() || e instanceof AbortError) return;
       console.warn('AI brow removal unavailable, using classic fill', e);
       if (window.__brow) window.__brow.aiError = String(e && e.message || e);
+      aiFailed = true;
     }
     busy.side = -1;
     busySetImage(state.clean);
     await new Promise((r) => setTimeout(r, 650));
+    if (!alive()) return;
     if (window.__brow) window.__brow.maxGap = Math.round(busy.maxGap);
-    await busyFinish();
+    await busyFinish(alive);
+    if (!alive()) return;
+    if (aiFailed) { setStatus('AI erase was unavailable, so a basic erase was used. Try again for the full result.'); setTimeout(() => { if (alive()) setStatus(''); }, 4000); }
     if (hair) els.color.value = hair;
     syncOutputs();
     state.brows = mapBrows(state.face, settings());
     state.timeline = buildTimeline(state.face, state.brows);
     play();
   } catch (err) {
+    if (!alive()) return;
     console.error(err);
     busyFail();
     setStatus('Something went wrong: ' + (err && err.message ? err.message : err), true);
