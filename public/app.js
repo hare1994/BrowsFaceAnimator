@@ -1978,14 +1978,51 @@ function makeComposer(OW, OH) {
   const { W, H } = state;
   const k = Math.min(OW / W, OH / H), dw = W * k, dh = H * k;
   const dx = (OW - dw) / 2, dy = (OH - dh) / 2;
-  // blurred background: built once from the erased photo
-  let bg = null;
-  if (dw < OW - 1 || dh < OH - 1) {
+  const vertical0 = OH > OW * 1.2;
+  // when the photo does not fill the frame it is shown as a card on a
+  // designed backdrop (built once): a deep gradient in the photo's own tones,
+  // a soft glow behind the card, a vignette and fine grain
+  const letterbox = dw < OW - 1 || dh < OH - 1;
+  let bg = null, card = { x: dx, y: dy, w: dw, h: dh, r: 0 };
+  if (letterbox) {
+    // card slightly inset so its rounded corners and shadow show
+    const inset = Math.min(OW, OH) * 0.06;
+    const k2 = Math.min((OW - inset * 2) / W, (OH - inset * 2) / H);
+    card = { w: W * k2, h: H * k2, r: Math.min(OW, OH) * 0.035 };
+    card.x = (OW - card.w) / 2;
+    // vertical: keep the card a bit above centre (captions and app buttons sit below)
+    card.y = vertical0 ? Math.max(inset, (OH - card.h) * 0.4) : (OH - card.h) / 2;
+    // average colour of the photo
+    const t = document.createElement('canvas'); t.width = 16; t.height = 16;
+    const tg = t.getContext('2d', { willReadFrequently: true }); tg.drawImage(state.clean, 0, 0, 16, 16);
+    const px = tg.getImageData(0, 0, 16, 16).data;
+    let r = 0, g = 0, b = 0;
+    for (let k = 0; k < px.length; k += 4) { r += px[k]; g += px[k + 1]; b += px[k + 2]; }
+    const n = px.length / 4; r /= n; g /= n; b /= n;
+    const tone = (m, add = 0) => `rgb(${clamp(r * m + add, 0, 255) | 0},${clamp(g * m + add, 0, 255) | 0},${clamp(b * m + add, 0, 255) | 0})`;
     bg = document.createElement('canvas'); bg.width = OW; bg.height = OH;
-    const b = bg.getContext('2d');
-    const kc = Math.max(OW / W, OH / H);
-    b.filter = `blur(${Math.round(Math.min(OW, OH) * 0.03)}px) brightness(0.55)`;
-    b.drawImage(state.clean, (OW - W * kc) / 2, (OH - H * kc) / 2, W * kc, H * kc);
+    const c2 = bg.getContext('2d');
+    const lin = c2.createLinearGradient(0, 0, OW * 0.3, OH);
+    lin.addColorStop(0, tone(0.34, 6)); lin.addColorStop(0.55, tone(0.2, 4)); lin.addColorStop(1, tone(0.1, 2));
+    c2.fillStyle = lin; c2.fillRect(0, 0, OW, OH);
+    const cx = OW / 2, cy = card.y + card.h / 2;
+    const glow = c2.createRadialGradient(cx, cy, 0, cx, cy, Math.max(card.w, card.h) * 0.9);
+    glow.addColorStop(0, tone(0.75, 30).replace('rgb', 'rgba').replace(')', ',0.55)'));
+    glow.addColorStop(1, 'rgba(0,0,0,0)');
+    c2.fillStyle = glow; c2.fillRect(0, 0, OW, OH);
+    const vig = c2.createRadialGradient(OW / 2, OH / 2, Math.min(OW, OH) * 0.35, OW / 2, OH / 2, Math.hypot(OW, OH) * 0.62);
+    vig.addColorStop(0, 'rgba(0,0,0,0)'); vig.addColorStop(1, 'rgba(0,0,0,0.55)');
+    c2.fillStyle = vig; c2.fillRect(0, 0, OW, OH);
+    // fine grain (avoids colour banding in the video)
+    const gr = c2.getImageData(0, 0, OW, OH), gd = gr.data, rnd = mulberry32(5);
+    for (let k = 0; k < gd.length; k += 4) { const v = (rnd() - 0.5) * 9; gd[k] += v; gd[k + 1] += v; gd[k + 2] += v; }
+    c2.putImageData(gr, 0, 0);
+    // card shadow
+    c2.save();
+    c2.shadowColor = 'rgba(0,0,0,0.55)'; c2.shadowBlur = Math.min(OW, OH) * 0.05; c2.shadowOffsetY = Math.min(OW, OH) * 0.015;
+    c2.fillStyle = '#000';
+    c2.beginPath(); c2.roundRect ? c2.roundRect(card.x, card.y, card.w, card.h, card.r) : c2.rect(card.x, card.y, card.w, card.h); c2.fill();
+    c2.restore();
   }
   const vertical = OH > OW * 1.2;
   function caption(text) {
@@ -1996,7 +2033,9 @@ function makeComposer(OW, OH) {
     o.direction = getLang() === 'he' ? 'rtl' : 'ltr';
     o.textAlign = 'center'; o.textBaseline = 'middle';
     // Reels/TikTok cover the bottom ~20% with their own buttons: stay above it
-    const y = vertical ? OH * 0.72 : OH * 0.86;
+    let y = vertical ? (bg ? Math.min(OH * 0.76, Math.max(OH * 0.66, card.y + card.h - size * 1.6)) : OH * 0.72) : OH * 0.86;
+    // room under the card (inside the safe area)? put the caption there, off the face
+    if (bg) { const below = card.y + card.h + size * 1.9; if (below + size * 1.6 < (vertical ? OH * 0.8 : OH - size)) y = below; }
     const words = text.split(' '), lines = [];
     let line = '';
     for (const w of words) {
@@ -2025,16 +2064,26 @@ function makeComposer(OW, OH) {
     o.save();
     o.globalAlpha = 0.95;
     o.shadowColor = 'rgba(0,0,0,0.35)'; o.shadowBlur = m * 0.4;
-    o.drawImage(img, m, vertical ? OH * 0.06 : m, w, h);
+    // centred above the card when there is room, else in the top corner
+    if (bg && card.y > h + m * 1.6) o.drawImage(img, (OW - w) / 2, (card.y - h) / 2, w, h);
+    else o.drawImage(img, m, vertical ? OH * 0.06 : m, w, h);
     o.restore();
   }
   return {
     canvas: out,
     frame(src, cap) {
       o.setTransform(1, 0, 0, 1, 0, 0);
-      if (bg) o.drawImage(bg, 0, 0); else { o.fillStyle = '#000'; o.fillRect(0, 0, OW, OH); }
       o.imageSmoothingQuality = 'high';
-      o.drawImage(src, dx, dy, dw, dh);
+      if (bg) {
+        o.drawImage(bg, 0, 0);
+        o.save();
+        o.beginPath(); o.roundRect ? o.roundRect(card.x, card.y, card.w, card.h, card.r) : o.rect(card.x, card.y, card.w, card.h); o.clip();
+        o.drawImage(src, card.x, card.y, card.w, card.h);
+        o.restore();
+        // thin light edge around the card
+        o.save(); o.strokeStyle = 'rgba(255,255,255,0.14)'; o.lineWidth = Math.max(1, Math.min(OW, OH) * 0.0015);
+        o.beginPath(); o.roundRect ? o.roundRect(card.x, card.y, card.w, card.h, card.r) : o.rect(card.x, card.y, card.w, card.h); o.stroke(); o.restore();
+      } else o.drawImage(src, dx, dy, dw, dh);
       caption(cap);
       logo();
     },
