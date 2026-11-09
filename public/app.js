@@ -418,6 +418,29 @@ function settings() {
   };
 }
 
+// Bottom edge of her real brow head (face frame), measured from the hair mask
+// found while erasing. null when there is no mask.
+function ownBrowBottom(face) {
+  const b = state.browInfo;
+  if (!b) return null;
+  const { mask, bx0, by0, bw, bh } = b;
+  const { midX, eyeW } = face;
+  const h0 = Math.min(face.noseHalf, face.innerCornerHalf) * 0.8;
+  const vals = [];
+  for (let x = 0; x < bw; x++) {
+    let bot = -1;
+    for (let y = bh - 1; y >= 0; y--) if (mask[y * bw + x]) { bot = y; break; }
+    if (bot < 0) continue;
+    const q = face.F(pt(x + bx0, bot + by0));
+    const half = Math.abs(q.x - midX);
+    if (half >= h0 && half <= h0 + eyeW * 0.4) vals.push(q.y);
+  }
+  if (vals.length < 6) return null;
+  vals.sort((a, b) => a - b);
+  // the mask reaches a little past the hairs; step back to the hair edge
+  return vals[vals.length >> 1] - eyeW * 0.03;
+}
+
 function mapBrows(face, s) {
   const { midX, eyeY, eyeW } = face;
 
@@ -427,9 +450,14 @@ function mapBrows(face, s) {
   //   head 0.40–0.67 · arch 0.62–0.89 · tail 0.46
 
   // Brow base: mostly where her own brow bone / brow sits.
+  // The real brow (found while erasing) is the most reliable guide: the new
+  // brow head sits where her own brow head was, even for brows set very
+  // close to the eyes. Landmarks are only a fallback.
   const idealBot = eyeY - 0.45 * eyeW;
-  const ownBot = face.browInBotY + 0.06 * eyeW;
-  const innerBotY = Math.abs(ownBot - idealBot) < 0.3 * eyeW ? lerp(idealBot, ownBot, 0.85) : idealBot;
+  const measured = ownBrowBottom(face);
+  const ownBot = measured != null ? measured : face.browInBotY + 0.06 * eyeW;
+  const innerBotY = measured != null ? lerp(idealBot, ownBot, 0.9)
+    : Math.abs(ownBot - idealBot) < 0.3 * eyeW ? lerp(idealBot, ownBot, 0.85) : idealBot;
 
   const thickness = 0.27 * eyeW * s.thick;
   const innerTopY = innerBotY - thickness;
@@ -1206,6 +1234,7 @@ async function loadFile(file) {
   const myRun = ++loadRun;
   const alive = () => myRun === loadRun;
   state.playing = false;
+  state.browInfo = null;
   document.documentElement.dataset.browState = 'loading';
   els.intro.hidden = true;
   els.studio.hidden = false;
@@ -1262,6 +1291,7 @@ async function loadFile(file) {
     if (!alive()) return;
     state.clean = canvas;
     busySetBrow(brow, state.face);
+    state.browInfo = brow;
     // AI repaint (better skin, shading and texture); the classic fill stays as fallback
     let aiFailed = false;
     const sideMs = busyTimes.side;

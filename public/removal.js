@@ -375,6 +375,20 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     let y = bandBot[x] + 1;
     while (y <= lim && Ls[y * bw + x] / ref < 0.45) { bandM[y * bw + x] = 1; bandBot[x] = y; y++; }
   }
+  // brows set right down on the eye: where the band runs into the eyelid limit,
+  // follow brownish, grainy hair a little further down (never the lash line,
+  // never the near-black lashes themselves)
+  for (let x = 0; x < bw; x++) {
+    if (bandBot[x] < 0 || bandBot[x] < Math.floor(floorAt[x]) - 1) continue;
+    const ref = skinAbove[x];
+    const lim = Math.min(bh - 1, Math.floor(lidAt[x] - eyeW * 0.045));
+    for (let y = Math.floor(floorAt[x]) + 1; y <= lim; y++) {
+      const k = y * bw + x, r = L[k] / ref;
+      if (!(r > 0.36 && r < 0.9 && (Tex[k] > texThr * 0.8 || r < 0.75))) break;
+      if (!search[k] || !oval[k]) break;
+      bandM[k] = 1; allowed[k] = 1; bandBot[x] = y;
+    }
+  }
   // brows have no holes: smooth the band outline across columns
   {
     const r = Math.max(1, Math.round(eyeW * 0.02));
