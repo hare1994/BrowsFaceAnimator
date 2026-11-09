@@ -1,7 +1,10 @@
 // Runs the MI-GAN skin model in its own thread. A fresh worker is a fresh
 // JavaScript realm, so if one configuration fails (e.g. multi-threading on a
 // memory-limited phone) the page can simply start another one.
-import * as ort from './vendor/ort/ort.wasm.min.mjs';
+// two engines: 'fast' = onnxruntime-web 1.22 (multi-threaded, reserves a lot of
+// memory up front); 'light' = 1.18 single-threaded SIMD build, which does not,
+// for phones / browsers that report "out of memory"
+let ort = null;
 
 let session = null;
 
@@ -38,11 +41,20 @@ self.onmessage = async (e) => {
   const m = e.data;
   try {
     if (m.type === 'init') {
-      ort.env.wasm.wasmPaths = m.wasmPaths;
-      ort.env.wasm.numThreads = m.threads;
+      ort = m.engine === 'light'
+        ? await import('./vendor/ort118/ort.wasm.min.js')
+        : await import('./vendor/ort/ort.wasm.min.mjs');
+      ort.env.wasm.wasmPaths = m.engine === 'light' ? m.wasmPathsLight : m.wasmPaths;
+      ort.env.wasm.numThreads = m.engine === 'light' ? 1 : m.threads;
       ort.env.wasm.proxy = false;
       const buf = await download(m.urls, m.expected);
-      session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+      // no pre-allocated memory arenas: much lower peak memory
+      session = await ort.InferenceSession.create(buf, {
+        executionProviders: ['wasm'],
+        enableCpuMemArena: false,
+        enableMemPattern: false,
+        executionMode: 'sequential',
+      });
       // smoke test on a tiny image so a broken setup fails here, not mid-photo
       const n = 48 * 48, img = new Uint8Array(3 * n).fill(180), known = new Uint8Array(n).fill(255);
       for (let y = 20; y < 28; y++) for (let x = 16; x < 32; x++) known[y * 48 + x] = 0;

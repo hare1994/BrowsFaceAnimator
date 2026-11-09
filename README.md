@@ -59,6 +59,6 @@ Or from your own computer: `npx wrangler deploy`.
 
 - **MediaPipe Face Landmarker**, Google (Apache 2.0)
 - **MI-GAN** inpainting model, Picsart AI Research (MIT). Uses `migan_pipeline_v2.onnx`, taken from the npm package `migan-onnx` and split in two.
-- **onnxruntime-web**, Microsoft (MIT)
+- **onnxruntime-web**, Microsoft (MIT): 1.22 multi-threaded build (fast mode) and the 1.18 single-threaded SIMD build (light mode, for devices that run out of memory)
 
 `public/_headers` turns on cross-origin isolation, which lets the AI model use several CPU threads (about 2x faster).

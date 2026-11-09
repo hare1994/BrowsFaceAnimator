@@ -228,18 +228,18 @@ function getMigan() {
       try { safe = localStorage.getItem('brow-ai-safe') === '1'; } catch {}
       const canThread = self.crossOriginIsolated && (navigator.hardwareConcurrency || 1) > 1;
       const modes = [];
-      if (canThread && !safe) modes.push(Math.min(4, navigator.hardwareConcurrency || 1));
-      modes.push(1);
+      if (canThread && !safe) modes.push({ engine: 'fast', threads: Math.min(4, navigator.hardwareConcurrency || 1) });
+      modes.push({ engine: 'light', threads: 1 });
       const errors = [];
-      for (const threads of modes) {
+      for (const mode of modes) {
         try {
-          const w = await startAiWorker(threads);
-          miganLoad.ready = true; miganLoad.mode = threads > 1 ? `${threads} threads` : 'single thread';
+          const w = await startAiWorker(mode.threads, mode.engine);
+          miganLoad.ready = true; miganLoad.mode = mode.engine + ' ' + mode.threads;
           return w;
         } catch (e) {
-          errors.push(`${threads > 1 ? 'fast' : 'safe'} mode: ${e.message || e}`);
-          console.warn('AI start failed', threads, e);
-          if (threads > 1) { try { localStorage.setItem('brow-ai-safe', '1'); } catch {} }
+          errors.push(`${mode.engine} mode: ${e.message || e}`);
+          console.warn('AI start failed', mode, e);
+          if (mode.engine === 'fast') { try { localStorage.setItem('brow-ai-safe', '1'); } catch {} }
           miganLoad.loaded = 0; miganLoad.total = 0;
         }
       }
@@ -250,10 +250,10 @@ function getMigan() {
   return miganPromise;
 }
 
-function startAiWorker(threads) {
+function startAiWorker(threads, engine = threads > 1 ? 'fast' : 'light') {
   return new Promise((resolve, reject) => {
     let w;
-    if (threads > 1 && /[?&]aitest=failfast/.test(location.search)) { reject(new Error('forced failure (test)')); return; }
+    if (engine === 'fast' && /[?&]aitest=failfast/.test(location.search)) { reject(new Error('forced failure (test)')); return; }
     try { w = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' }); }
     catch (e) { reject(new Error('this browser cannot start the AI worker')); return; }
     const pending = new Map();
@@ -300,8 +300,9 @@ function startAiWorker(threads) {
       }
     };
     w.postMessage({
-      type: 'init', id: 0, threads, expected: MIGAN_BYTES,
+      type: 'init', id: 0, threads, engine, expected: MIGAN_BYTES,
       wasmPaths: new URL('./vendor/ort/', import.meta.url).href,
+      wasmPathsLight: new URL('./vendor/ort118/', import.meta.url).href,
       urls: ['migan.part0', 'migan.part1'].map((f) => new URL('./models/' + f, import.meta.url).href),
     });
   });
@@ -1383,7 +1384,7 @@ async function runDiagnostics() {
   try { log('safe-mode flag: ' + localStorage.getItem('brow-ai-safe')); } catch { log('safe-mode flag: (storage blocked)'); }
   log('\nfiles:');
   const files = ['app.js', 'ai-worker.js', 'removal-worker.js', 'removal.js', 'vendor/ort/ort.wasm.min.mjs', 'vendor/ort/ort-wasm-simd-threaded.mjs',
-    'vendor/ort/ort-wasm-simd-threaded.wasm', 'models/migan.part0', 'models/migan.part1', 'models/face_landmarker.task'];
+    'vendor/ort/ort-wasm-simd-threaded.wasm', 'vendor/ort118/ort.wasm.min.js', 'vendor/ort118/ort-wasm-simd.wasm', 'models/migan.part0', 'models/migan.part1', 'models/face_landmarker.task'];
   for (const f of files) {
     try {
       const r = await fetch(new URL('./' + f, import.meta.url), { cache: 'no-store' });
@@ -1391,11 +1392,11 @@ async function runDiagnostics() {
       log(`  ${f}: ${r.status} ${r.headers.get('content-type') || '-'} ${b.byteLength} bytes` + (r.headers.get('cross-origin-embedder-policy') ? ' coep' : ''));
     } catch (e) { log(`  ${f}: FAILED ${e.message || e}`); }
   }
-  for (const threads of [Math.min(4, navigator.hardwareConcurrency || 1), 1]) {
-    log(`\nAI test, ${threads} thread(s):`);
+  for (const [engine, threads] of [['fast', Math.min(4, navigator.hardwareConcurrency || 1)], ['light', 1]]) {
+    log(`\nAI test, ${engine} engine, ${threads} thread(s):`);
     const t0 = performance.now();
     try {
-      const m = await startAiWorker(threads);
+      const m = await startAiWorker(threads, engine);
       log(`  started in ${Math.round(performance.now() - t0)} ms`);
       const n = 64 * 64, chw = new Uint8Array(3 * n).fill(170), known = new Uint8Array(n).fill(255);
       for (let y = 24; y < 40; y++) for (let x = 20; x < 44; x++) known[y * 64 + x] = 0;
