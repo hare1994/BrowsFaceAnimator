@@ -1,4 +1,5 @@
 import { FaceLandmarker, FilesetResolver } from './vendor/mediapipe/vision_bundle.mjs';
+import * as ort from './vendor/ort/ort.wasm.min.mjs';
 
 /* ------------------------------------------------------------------ *
  * Brow Mapping Studio
@@ -220,280 +221,635 @@ function solveHarmonic(img, unk, w, h) {
   }
 }
 
+/* ------------------------------ brow removal ------------------------------
+ * 1. Find the actual brow hairs: start from the landmark brow shape and grow
+ *    into every connected pixel that is clearly darker than the skin around
+ *    it. The search never leaves the face, never goes down to the eyelid and
+ *    never strays far from the brow, so nothing else on the face is touched.
+ * 2. Fill: a smooth skin base (harmonic fill) whose tone comes from the brow
+ *    bone, plus real skin texture (pores, grain) copied block by block from
+ *    clean skin nearby.
+ * ------------------------------------------------------------------------- */
+
+const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+  152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+const LID_R = [33, 246, 161, 160, 159, 158, 157, 173, 133];
+const LID_L = [263, 466, 388, 387, 386, 385, 384, 398, 362];
+const BROW_LOW_R = [46, 53, 52, 65, 55], BROW_LOW_L = [276, 283, 282, 295, 285];
+
+// --- small image helpers (all on a w*h grid) ---
+function dilateMask(m, w, h, r) {
+  if (r <= 0) return m.slice();
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let cnt = 0; const row = y * w;
+    for (let x = 0; x <= Math.min(r, w - 1); x++) cnt += m[row + x];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = cnt > 0 ? 1 : 0;
+      const add = x + r + 1, rem = x - r;
+      if (add < w) cnt += m[row + add];
+      if (rem >= 0) cnt -= m[row + rem];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let cnt = 0;
+    for (let y = 0; y <= Math.min(r, h - 1); y++) cnt += tmp[y * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = cnt > 0 ? 1 : 0;
+      const add = y + r + 1, rem = y - r;
+      if (add < h) cnt += tmp[add * w + x];
+      if (rem >= 0) cnt -= tmp[rem * w + x];
+    }
+  }
+  return out;
+}
+function erodeMask(m, w, h, r) {
+  const inv = new Uint8Array(w * h);
+  for (let j = 0; j < w * h; j++) inv[j] = m[j] ? 0 : 1;
+  const d = dilateMask(inv, w, h, r);
+  for (let j = 0; j < w * h; j++) d[j] = d[j] ? 0 : 1;
+  return d;
+}
+// separable box blur of a multi-channel float image
+function boxBlur(src, w, h, ch, r) {
+  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) for (let c = 0; c < ch; c++) {
+    let s = 0, n = 0;
+    for (let x = 0; x <= Math.min(r, w - 1); x++) { s += src[(y * w + x) * ch + c]; n++; }
+    for (let x = 0; x < w; x++) {
+      tmp[(y * w + x) * ch + c] = s / n;
+      const add = x + r + 1, rem = x - r;
+      if (add < w) { s += src[(y * w + add) * ch + c]; n++; }
+      if (rem >= 0) { s -= src[(y * w + rem) * ch + c]; n--; }
+    }
+  }
+  for (let x = 0; x < w; x++) for (let c = 0; c < ch; c++) {
+    let s = 0, n = 0;
+    for (let y = 0; y <= Math.min(r, h - 1); y++) { s += tmp[(y * w + x) * ch + c]; n++; }
+    for (let y = 0; y < h; y++) {
+      out[(y * w + x) * ch + c] = s / n;
+      const add = y + r + 1, rem = y - r;
+      if (add < h) { s += tmp[(add * w + x) * ch + c]; n++; }
+      if (rem >= 0) { s -= tmp[(rem * w + x) * ch + c]; n--; }
+    }
+  }
+  return out;
+}
+// y of a polyline (landmark points) at x, flat beyond its ends
+function lineY(pts, x) {
+  const s = [...pts].sort((a, b) => a.x - b.x);
+  if (x <= s[0].x) return s[0].y;
+  if (x >= s[s.length - 1].x) return s[s.length - 1].y;
+  for (let i = 1; i < s.length; i++) if (x <= s[i].x) {
+    const t = (x - s[i - 1].x) / Math.max(1e-6, s[i].x - s[i - 1].x);
+    return lerp(s[i - 1].y, s[i].y, t);
+  }
+  return s[0].y;
+}
+
 function removeBrows(src, face) {
   const { W, H } = state;
   const { P, eyeW } = face;
-  const mask = makeCanvas(W, H);
-  const m = mask.getContext('2d');
-  m.fillStyle = '#fff'; m.strokeStyle = '#fff';
-  m.lineJoin = 'round'; m.lineCap = 'round';
-  const brows = [LM.browPolyR, LM.browPolyL];
-  // Asymmetric dilation: generous above and to the sides (stray hairs),
-  // tight underneath so the eyelid crease / eyeshadow stays untouched.
-  const lift = eyeW * 0.07;
-  for (const [w, dy] of [[0.2, 0], [0.34, -lift]]) {
-    m.lineWidth = eyeW * w;
-    for (const poly of brows) {
-      m.beginPath();
-      poly.forEach((i, k) => (k ? m.lineTo(P[i].x, P[i].y + dy) : m.moveTo(P[i].x, P[i].y + dy)));
-      m.closePath(); m.fill(); m.stroke();
-    }
-  }
-
+  const t0 = performance.now();
   const sctx = src.getContext('2d', { willReadFrequently: true });
-  const img = sctx.getImageData(0, 0, W, H);
-  const d = img.data;
-  const md = m.getImageData(0, 0, W, H).data;
-  const inMask = (x, y) => x >= 0 && y >= 0 && x < W && y < H && md[(y * W + x) * 4 + 3] > 127;
+  const d = sctx.getImageData(0, 0, W, H).data;
 
-  // Skin reference + catch stray brow hairs just outside the mask.
-  const ringCv = makeCanvas(W, H), rg = ringCv.getContext('2d');
-  rg.strokeStyle = '#fff'; rg.fillStyle = '#fff'; rg.lineJoin = 'round'; rg.lineCap = 'round';
-  rg.lineWidth = eyeW * 0.72;
-  for (const poly of brows) {
-    rg.beginPath();
-    poly.forEach((i, k) => (k ? rg.lineTo(P[i].x, P[i].y) : rg.moveTo(P[i].x, P[i].y)));
-    rg.closePath(); rg.fill(); rg.stroke();
-  }
-  const ringD = rg.getImageData(0, 0, W, H).data;
-  const ringIdx = [];
-  for (let k = 0; k < W * H; k++) if (ringD[k * 4 + 3] > 127 && md[k * 4 + 3] <= 127) ringIdx.push(k);
-  const ringLum = ringIdx.map((k) => lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2])).sort((a, b) => a - b);
-  const skinLum = ringLum.length ? ringLum[Math.floor(ringLum.length * 0.7)] : 180;
-  // lower edge of each brow (landmarks), used as a floor for growing
-  const lowerR = [46, 53, 52, 65, 55].map((i) => P[i]), lowerL = [276, 283, 282, 295, 285].map((i) => P[i]);
-  const floorY = (x) => {
-    const line = Math.abs(x - lowerR[4].x) < Math.abs(x - lowerL[4].x) ? lowerR : lowerL;
-    const pts = [...line].sort((a, b) => a.x - b.x);
-    if (x <= pts[0].x) return pts[0].y;
-    if (x >= pts[pts.length - 1].x) return pts[pts.length - 1].y;
-    for (let i = 1; i < pts.length; i++) if (x <= pts[i].x) {
-      const t = (x - pts[i - 1].x) / Math.max(1, pts[i].x - pts[i - 1].x);
-      return lerp(pts[i - 1].y, pts[i].y, t);
-    }
-    return pts[0].y;
+  // ---- working box: brows + a band of forehead above (texture source) ----
+  const browIdx = [...LM.browPolyR, ...LM.browPolyL];
+  const bxs = browIdx.map((i) => P[i].x), bys = browIdx.map((i) => P[i].y);
+  const lidYs = [...LID_R, ...LID_L].map((i) => P[i].y);
+  const bx0 = Math.max(0, Math.floor(Math.min(...bxs) - eyeW * 0.6));
+  const bx1 = Math.min(W - 1, Math.ceil(Math.max(...bxs) + eyeW * 0.6));
+  const by0 = Math.max(0, Math.floor(Math.min(...bys) - eyeW * 1.1));
+  const by1 = Math.min(H - 1, Math.ceil(Math.max(...lidYs) + eyeW * 0.1));
+  const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1, N = bw * bh;
+
+  const draw = (fn) => {
+    const c = makeCanvas(bw, bh), g = c.getContext('2d');
+    g.translate(-bx0, -by0);
+    g.fillStyle = '#fff'; g.strokeStyle = '#fff'; g.lineJoin = 'round'; g.lineCap = 'round';
+    fn(g);
+    const a = g.getImageData(0, 0, bw, bh).data, m = new Uint8Array(N);
+    for (let j = 0; j < N; j++) m[j] = a[j * 4 + 3] > 127 ? 1 : 0;
+    return m;
   };
-  const grown = [];
-  for (const k of ringIdx) {
-    const x = k % W, y = (k / W) | 0;
-    if (y > floorY(x) + eyeW * 0.03) continue;
-    if (lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2]) < skinLum * 0.62) { md[k * 4 + 3] = 255; grown.push(k); }
+  const path = (g, idx, dy = 0) => {
+    g.beginPath();
+    idx.forEach((i, k) => (k ? g.lineTo(P[i].x, P[i].y + dy) : g.moveTo(P[i].x, P[i].y + dy)));
+    g.closePath();
+  };
+
+  // face, shrunk a little so hairline / temples are never touched
+  const oval = draw((g) => {
+    path(g, FACE_OVAL); g.fill();
+    g.globalCompositeOperation = 'destination-out'; g.lineWidth = eyeW * 0.1; path(g, FACE_OVAL); g.stroke();
+  });
+  // where brow hair may be searched for
+  const search = draw((g) => {
+    g.lineWidth = eyeW * 0.62;
+    for (const p of [LM.browPolyR, LM.browPolyL]) { path(g, p); g.fill(); g.stroke(); }
+  });
+  // certainly brow
+  const coreShape = draw((g) => {
+    g.lineWidth = eyeW * 0.07;
+    for (const p of [LM.browPolyR, LM.browPolyL]) { path(g, p); g.fill(); g.stroke(); }
+  });
+  // texture-source exclusion (generous brow area)
+  const nearBrow = draw((g) => {
+    g.lineWidth = eyeW * 0.75;
+    for (const p of [LM.browPolyR, LM.browPolyL]) { path(g, p); g.fill(); g.stroke(); }
+  });
+
+  // floor: never below the brow's lower edge + margin, never near the eyelid
+  const lowR = BROW_LOW_R.map((i) => P[i]), lowL = BROW_LOW_L.map((i) => P[i]);
+  const lidR = LID_R.map((i) => P[i]), lidL = LID_L.map((i) => P[i]);
+  const cR = P[LM.irisR].x, cL = P[LM.irisL].x;
+  const floorAt = new Float32Array(bw), lidAt = new Float32Array(bw);
+  for (let x = 0; x < bw; x++) {
+    const ix = x + bx0, right = Math.abs(ix - cR) < Math.abs(ix - cL);
+    const fb = lineY(right ? lowR : lowL, ix) + eyeW * 0.3;
+    const fl = lineY(right ? lidR : lidL, ix) - eyeW * 0.1;
+    floorAt[x] = Math.min(fb, fl) - by0;
+    lidAt[x] = lineY(right ? lidR : lidL, ix) - by0;
   }
-  for (const k of grown) { // include the soft edges of those hairs
-    const x = k % W, y = (k / W) | 0;
-    for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
-      const xx = x + ox, yy = y + oy;
-      if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-      const kk = yy * W + xx;
-      if (ringD[kk * 4 + 3] > 127 && yy <= floorY(xx) + eyeW * 0.03 && lum(d[kk * 4], d[kk * 4 + 1], d[kk * 4 + 2]) < skinLum * 0.85) md[kk * 4 + 3] = 255;
+
+  const rgb = new Float32Array(N * 3), L = new Float32Array(N);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const j = y * bw + x, k = ((y + by0) * W + (x + bx0)) * 4;
+    rgb[j * 3] = d[k]; rgb[j * 3 + 1] = d[k + 1]; rgb[j * 3 + 2] = d[k + 2];
+    L[j] = lum(d[k], d[k + 1], d[k + 2]);
+  }
+  const allowed = new Uint8Array(N);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const j = y * bw + x;
+    allowed[j] = search[j] && oval[j] && y <= floorAt[x] ? 1 : 0;
+  }
+
+  // ---- 1. find the brow hair ----
+  let mask = new Uint8Array(N);
+
+  const ringR = Math.max(3, Math.round(eyeW * 0.07));
+  const skinLum = (m) => {
+    const f = new Float32Array(rgb);
+    const hide = dilateMask(m, bw, bh, ringR);
+    solveHarmonic(f, hide, bw, bh);
+    const out = new Float32Array(N);
+    for (let j = 0; j < N; j++) out[j] = lum(f[j * 3], f[j * 3 + 1], f[j * 3 + 2]);
+    return out;
+  };
+  // fine texture (hair is grainy, shadows are smooth)
+  const hp = new Float32Array(N);
+  { const b1 = boxBlur(L, bw, bh, 1, 1); for (let k = 0; k < N; k++) hp[k] = Math.abs(L[k] - b1[k]); }
+  const Tex = boxBlur(hp, bw, bh, 1, 2);
+  // skin tone just above the search area, per column (forehead reference)
+  const skinAbove = new Float32Array(bw);
+  const lowLine = new Float32Array(bw);
+  {
+    const has = new Uint8Array(bw);
+    for (let x = 0; x < bw; x++) {
+      const ix = x + bx0, right = Math.abs(ix - cR) < Math.abs(ix - cL);
+      lowLine[x] = lineY(right ? lowR : lowL, ix) - by0;
+      let t = -1;
+      for (let y = 0; y < bh; y++) if (search[y * bw + x]) { t = y; break; }
+      if (t < 0) continue;
+      const vals = [];
+      for (let y = Math.max(0, t - 10); y < t - 1; y++) vals.push(L[y * bw + x]);
+      if (!vals.length) continue;
+      vals.sort((a, b) => a - b);
+      skinAbove[x] = vals[Math.floor(vals.length * 0.6)]; has[x] = 1;
     }
+    let last = -1;
+    for (let x = 0; x < bw; x++) {
+      if (has[x]) { if (last < 0) for (let k = 0; k < x; k++) skinAbove[k] = skinAbove[x]; last = x; }
+      else if (last >= 0) skinAbove[x] = skinAbove[last];
+    }
+    skinAbove.set(boxBlur(skinAbove, bw, 1, 1, Math.max(3, Math.round(eyeW * 0.1))));
   }
-  m.putImageData(new ImageData(new Uint8ClampedArray(md), W, H), 0, 0);
-  if (window.__brow) window.__brow.lastMask = mask;
-
-  // Hair colour: darkest pixels inside the (un-dilated) brow polygons.
-  const tight = makeCanvas(W, H).getContext('2d');
-  tight.fillStyle = '#fff';
-  for (const poly of brows) {
-    tight.beginPath();
-    poly.forEach((i, k) => (k ? tight.lineTo(P[i].x, P[i].y) : tight.moveTo(P[i].x, P[i].y)));
-    tight.closePath(); tight.fill();
+  // typical skin graininess (forehead) -> what counts as "hair texture"
+  let texThr;
+  {
+    const v = [];
+    for (let y = 0; y < bh; y += 2) for (let x = 0; x < bw; x += 2) {
+      const k = y * bw + x;
+      if (oval[k] && !search[k] && y < lowLine[x]) v.push(Tex[k]);
+    }
+    v.sort((a, b) => a - b);
+    texThr = (v.length ? v[Math.floor(v.length * 0.6)] : 3) * 1.6 + 1;
   }
-  const td = tight.getImageData(0, 0, W, H).data;
+  // hair test for single pixels: very dark, or darker *and* grainy
+  const isHair = (k, ref) => {
+    const r = L[k] / ref;
+    return r < 0.36 || (r < 0.93 && ref - L[k] > 7 && Tex[k] > texThr);
+  };
 
-  let x0 = W, y0 = H, x1 = 0, y1 = 0;
-  const browPx = [];
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const k = (y * W + x) * 4;
-    if (md[k + 3] > 127) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
-    if (td[k + 3] > 127) browPx.push([d[k], d[k + 1], d[k + 2], lum(d[k], d[k + 1], d[k + 2])]);
-  }
-
-  // Robust sample of skin next to the mask (brighter half of a small patch).
-  function sample(x, y, dx, dy) {
-    const px = [];
-    for (let s = 2; s <= 12; s++) {
-      for (let o = -1; o <= 1; o++) {
-        const sx = x + dx * s + (dy ? o : 0), sy = y + dy * s + (dx ? o : 0);
-        if (sx < 0 || sy < 0 || sx >= W || sy >= H || inMask(sx, sy)) continue;
-        const k = (sy * W + sx) * 4;
-        px.push([d[k], d[k + 1], d[k + 2], lum(d[k], d[k + 1], d[k + 2])]);
+  // ---- the brow band, column by column ----
+  // Smooth the darkness a little, find the darkest point near the landmark
+  // brow line, and take the connected stretch that stays clearly dark.
+  // Eyeshadow, lid skin and the crease are lighter than the hair, so the
+  // band stops where the brightness comes back.
+  const upR = [70, 63, 105, 66, 107].map((i) => P[i]), upL = [300, 293, 334, 296, 336].map((i) => P[i]);
+  const Ls = boxBlur(boxBlur(L, bw, bh, 1, Math.max(1, Math.round(eyeW * 0.012))), bw, bh, 1, 0);
+  const Lh = (() => { // extra horizontal smoothing so sparse hairs read as one band
+    const r = Math.max(2, Math.round(eyeW * 0.04)), out = new Float32Array(N);
+    for (let y = 0; y < bh; y++) {
+      let sum = 0, n = 0;
+      for (let x = 0; x <= Math.min(r, bw - 1); x++) { sum += Ls[y * bw + x]; n++; }
+      for (let x = 0; x < bw; x++) {
+        out[y * bw + x] = sum / n;
+        if (x + r + 1 < bw) { sum += Ls[y * bw + x + r + 1]; n++; }
+        if (x - r >= 0) { sum -= Ls[y * bw + x - r]; n--; }
       }
     }
-    if (!px.length) return null;
-    px.sort((a, b) => a[3] - b[3]);
-    const from = Math.floor(px.length * 0.4), to = Math.max(from + 1, Math.floor(px.length * 0.85));
-    let r = 0, g = 0, b = 0, n = 0;
-    for (let i = from; i < to; i++) { r += px[i][0]; g += px[i][1]; b += px[i][2]; n++; }
-    return [r / n, g / n, b / n];
+    return out;
+  })();
+  const bandM = new Uint8Array(N);
+  const bandTop = new Int32Array(bw).fill(-1), bandBot = new Int32Array(bw).fill(-1);
+  for (let x = 0; x < bw; x++) {
+    const ix = x + bx0, right = Math.abs(ix - cR) < Math.abs(ix - cL);
+    const uy = lineY(right ? upR : upL, ix) - by0, ly = lowLine[x];
+    const ref = skinAbove[x];
+    if (!ref) continue;
+    const ya = Math.max(0, Math.floor(uy - eyeW * 0.15)), yb = Math.min(bh - 1, Math.ceil(ly + eyeW * 0.06));
+    let best = -1, bestD = 0;
+    for (let y = ya; y <= yb; y++) {
+      const k = y * bw + x;
+      if (!allowed[k]) continue;
+      const D = (ref - Lh[k]) / ref;
+      if (D > bestD) { bestD = D; best = y; }
+    }
+    if (best < 0 || bestD < 0.1) continue;
+    const t = bestD * 0.55;
+    const inBand = (y) => { const k = y * bw + x; return allowed[k] && (ref - Ls[k]) / ref > t; };
+    let top = best, bot = best;
+    const gap = Math.max(1, Math.round(eyeW * 0.015));
+    for (let y = best - 1, miss = 0; y >= 0 && miss <= gap; y--) { if (inBand(y)) { top = y; miss = 0; } else miss++; }
+    for (let y = best + 1, miss = 0; y < bh && miss <= gap; y++) { if (inBand(y)) { bot = y; miss = 0; } else miss++; }
+    // a brow is never much thicker than the landmark brow (crease / shadow below)
+    const maxT = Math.max((ly - uy) * 1.3, eyeW * 0.15);
+    bandTop[x] = top; bandBot[x] = Math.min(bot, Math.round(ly + eyeW * 0.08), Math.round(top + maxT));
   }
-
-  if (x1 < x0 || y1 < y0) return { canvas: src, hair: null };
-  const t0 = performance.now();
-
-  // Work on a padded region around both brows.
-  const pad = Math.round(eyeW * 0.5);
-  const rx0 = Math.max(0, x0 - pad), ry0 = Math.max(0, y0 - pad);
-  const rx1 = Math.min(W - 1, x1 + pad), ry1 = Math.min(H - 1, y1 + pad);
-  const rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
-  const N = rw * rh;
-  const img3 = new Float32Array(N * 3);
-  const unk = new Uint8Array(N);
-  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
-    const j2 = y * rw + x, k = ((y + ry0) * W + (x + rx0)) * 4;
-    img3[j2 * 3] = d[k]; img3[j2 * 3 + 1] = d[k + 1]; img3[j2 * 3 + 2] = d[k + 2];
-    unk[j2] = md[k + 3] > 127 ? 1 : 0;
-  }
-
-  // 1) Smooth base: multi-scale harmonic fill (each missing pixel becomes the
-  //    average of its neighbours), so light and shading flow in seamlessly
-  //    from the clean skin around the brows.
-  //    Two solutions: H1 uses all surrounding skin; H2 replaces the skin
-  //    *below* the brows (lid crease / eyeshadow) with brow-bone tone, so
-  //    the shadow does not bleed up as a muddy band. H1 is only used right
-  //    next to the lower edge, keeping that edge seamless.
-  const imgB = new Float32Array(img3);
+  // remove column-to-column jumps (median over neighbouring columns)
   {
-    const ref = new Float32Array(rw * 3), has = new Uint8Array(rw);
-    for (let x = 0; x < rw; x++) {
-      let t = -1;
-      for (let y = 0; y < rh; y++) if (unk[y * rw + x]) { t = y; break; }
-      if (t < 0) continue;
+    const r = Math.max(2, Math.round(eyeW * 0.06));
+    const med = (arr, x) => {
+      const v = [];
+      for (let k = x - r; k <= x + r; k++) if (k >= 0 && k < bw && arr[k] >= 0) v.push(arr[k]);
+      if (v.length < r) return -1;
+      v.sort((a, b) => a - b); return v[v.length >> 1];
+    };
+    const t2 = new Int32Array(bw), b2 = new Int32Array(bw);
+    for (let x = 0; x < bw; x++) {
+      if (bandTop[x] < 0) { t2[x] = b2[x] = -1; continue; }
+      const mt = med(bandTop, x), mb = med(bandBot, x);
+      const tol = eyeW * 0.04;
+      t2[x] = mt < 0 ? bandTop[x] : Math.round(Math.max(bandTop[x], mt - tol));
+      b2[x] = mb < 0 ? bandBot[x] : Math.round(Math.min(bandBot[x], mb + tol));
+      // a column whose band sits far below its neighbours is not brow
+      if (mt >= 0 && bandTop[x] > mb) { t2[x] = b2[x] = -1; }
+    }
+    for (let x = 0; x < bw; x++) {
+      bandTop[x] = t2[x]; bandBot[x] = b2[x];
+      if (t2[x] >= 0) for (let y = t2[x]; y <= b2[x]; y++) bandM[y * bw + x] = 1;
+    }
+  }
+  // the lowest hairs: keep going down while it is still hair-dark (not crease-dark)
+  for (let x = 0; x < bw; x++) {
+    if (bandBot[x] < 0) continue;
+    const ref = skinAbove[x], lim = Math.min(bh - 1, Math.round(bandBot[x] + eyeW * 0.06), Math.floor(floorAt[x]));
+    let y = bandBot[x] + 1;
+    while (y <= lim && Ls[y * bw + x] / ref < 0.45) { bandM[y * bw + x] = 1; bandBot[x] = y; y++; }
+  }
+  // brows have no holes: smooth the band outline across columns
+  {
+    const r = Math.max(1, Math.round(eyeW * 0.02));
+    let b2 = erodeMask(dilateMask(bandM, bw, bh, r), bw, bh, r);
+    b2 = dilateMask(erodeMask(b2, bw, bh, 1), bw, bh, 1); // drop single-pixel specks
+    for (let k = 0; k < N; k++) mask[k] = b2[k] && allowed[k] ? 1 : 0;
+  }
+  // brow heads / ends where no band was found: landmark shape + hair test
+  for (let k = 0; k < N; k++) {
+    const x = k % bw;
+    if (!mask[k] && bandTop[x] < 0 && coreShape[k] && allowed[k] && isHair(k, skinAbove[x])) mask[k] = 1;
+  }
+  // stray hairs just outside the band (connected growth, limited distance)
+  {
+    const near = dilateMask(mask, bw, bh, Math.max(2, Math.round(eyeW * 0.05)));
+    const skin = skinLum(mask);
+    const q = [];
+    for (let k = 0; k < N; k++) if (mask[k]) q.push(k);
+    for (let qi = 0; qi < q.length; qi++) {
+      const k = q[qi], x = k % bw, y = (k / bw) | 0;
+      for (const nb of [x > 0 ? k - 1 : -1, x < bw - 1 ? k + 1 : -1, y > 0 ? k - bw : -1, y < bh - 1 ? k + bw : -1]) {
+        if (nb < 0 || mask[nb] || !near[nb] || !allowed[nb]) continue;
+        const nx = nb % bw, ny = (nb / bw) | 0;
+        // never extend downwards past the band (that is lid / eyeshadow)
+        if (bandBot[nx] >= 0 && ny > bandBot[nx]) continue;
+        if (isHair(nb, Math.max(skin[nb], skinAbove[nx] * 0.97))) { mask[nb] = 1; q.push(nb); }
+      }
+    }
+  }
+  // drop small isolated specks (keep the two brows)
+  {
+    const lab = new Int32Array(N).fill(-1), sizes = [];
+    for (let k = 0; k < N; k++) {
+      if (!mask[k] || lab[k] >= 0) continue;
+      const id = sizes.length, st = [k]; lab[k] = id; let n = 0;
+      while (st.length) {
+        const c = st.pop(); n++;
+        const x = c % bw, y = (c / bw) | 0;
+        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+          const xx = x + ox, yy = y + oy;
+          if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue;
+          const nb = yy * bw + xx;
+          if (mask[nb] && lab[nb] < 0) { lab[nb] = id; st.push(nb); }
+        }
+      }
+      sizes.push(n);
+    }
+    const big = Math.max(0, ...sizes);
+    for (let k = 0; k < N; k++) if (mask[k] && sizes[lab[k]] < big * 0.12) mask[k] = 0;
+  }
+  if (window.__brow) window.__brow.dbgBand = { bandTop, bandBot };
+  // tidy: close small gaps, then cover the soft (anti-aliased) hair edges
+  {
+    const rc = Math.max(1, Math.round(eyeW * 0.025));
+    mask = erodeMask(dilateMask(mask, bw, bh, rc), bw, bh, rc);
+    mask = dilateMask(mask, bw, bh, Math.max(1, Math.round(eyeW * 0.02)));
+    // fine hairs sit along the top edge and the ends: extend up (forehead side)
+    // and sideways, never down towards the eye
+    const up = Math.max(2, Math.round(eyeW * 0.06)), side = Math.max(1, Math.round(eyeW * 0.03));
+    const ext = new Uint8Array(N);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      if (!mask[y * bw + x]) continue;
+      for (let dy = 0; dy <= up; dy++) { const yy = y - dy; if (yy < 0) break; ext[yy * bw + x] = 1; }
+    }
+    const extS = dilateMask(ext, bw, bh, side);
+    for (let k = 0; k < N; k++) if (extS[k] && (k / bw | 0) <= (k % bw >= 0 ? floorAt[k % bw] : 0)) mask[k] = mask[k] || (oval[k] && search[k] ? 1 : 0);
+    for (let j = 0; j < N; j++) if (!(allowed[j] || coreShape[j] && oval[j])) mask[j] = 0;
+  }
+
+  // ---- mask for the AI inpainter: generous, covers every hair + the brow shape ----
+  let mlMask;
+  {
+    const u = new Uint8Array(N);
+    for (let k = 0; k < N; k++) u[k] = mask[k] || coreShape[k] ? 1 : 0;
+    mlMask = dilateMask(u, bw, bh, Math.max(2, Math.round(eyeW * 0.035)));
+    for (let k = 0; k < N; k++) {
+      const x = k % bw, y = (k / bw) | 0;
+      if (!oval[k] || y > lidAt[x] - eyeW * 0.07) mlMask[k] = 0;
+    }
+  }
+  if (window.__brow) {
+    const mc = makeCanvas(W, H), mg = mc.getContext('2d'), md = mg.createImageData(bw, bh);
+    for (let k = 0; k < N; k++) if (mlMask[k]) { md.data[k * 4] = md.data[k * 4 + 1] = md.data[k * 4 + 2] = 255; md.data[k * 4 + 3] = 255; }
+    mg.putImageData(md, bx0, by0);
+    window.__brow.lastMlMask = mc;
+  }
+
+  // ---- 2a. smooth skin base ----
+  // H1: all surrounding skin. H2: pixels *below* the brow replaced with the
+  // brow-bone tone so lid shadow / eyeshadow does not bleed upwards.
+  const H1 = new Float32Array(rgb), H2 = new Float32Array(rgb);
+  const topY = new Int32Array(bw).fill(-1), botY = new Int32Array(bw).fill(-1);
+  for (let x = 0; x < bw; x++) for (let y = 0; y < bh; y++) if (mask[y * bw + x]) { if (topY[x] < 0) topY[x] = y; botY[x] = y; }
+  {
+    const ref = new Float32Array(bw * 3), has = new Uint8Array(bw);
+    for (let x = 0; x < bw; x++) {
+      if (topY[x] < 0) continue;
       let n = 0;
-      for (let y = Math.max(0, t - 8); y < t - 1; y++) {
-        const j = y * rw + x; if (unk[j]) continue;
-        for (let c = 0; c < 3; c++) ref[x * 3 + c] += img3[j * 3 + c];
+      for (let y = Math.max(0, topY[x] - 8); y < topY[x] - 1; y++) {
+        const j = y * bw + x; if (mask[j]) continue;
+        for (let c = 0; c < 3; c++) ref[x * 3 + c] += rgb[j * 3 + c];
         n++;
       }
       if (n) { for (let c = 0; c < 3; c++) ref[x * 3 + c] /= n; has[x] = 1; }
     }
-    // fill columns without a reference from the nearest one, then smooth
     let last = -1;
-    for (let x = 0; x < rw; x++) if (has[x]) { if (last < 0) for (let k = 0; k < x; k++) for (let c = 0; c < 3; c++) ref[k * 3 + c] = ref[x * 3 + c]; last = x; }
+    for (let x = 0; x < bw; x++) {
+      if (has[x]) { if (last < 0) for (let k = 0; k < x; k++) for (let c = 0; c < 3; c++) ref[k * 3 + c] = ref[x * 3 + c]; last = x; }
       else if (last >= 0) for (let c = 0; c < 3; c++) ref[x * 3 + c] = ref[last * 3 + c];
-    const rr = Math.max(3, Math.round(eyeW * 0.12)), sm = new Float32Array(rw * 3);
-    for (let x = 0; x < rw; x++) {
-      let n = 0;
-      for (let o = -rr; o <= rr; o++) { const xx = Math.min(rw - 1, Math.max(0, x + o)); for (let c = 0; c < 3; c++) sm[x * 3 + c] += ref[xx * 3 + c]; n++; }
-      for (let c = 0; c < 3; c++) sm[x * 3 + c] /= n;
     }
-    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
-      const j = y * rw + x;
-      if (unk[j]) continue;
-      if (y + ry0 > floorY(x + rx0) - eyeW * 0.02) for (let c = 0; c < 3; c++) imgB[j * 3 + c] = sm[x * 3 + c];
-    }
-  }
-  solveHarmonic(img3, unk, rw, rh);
-  solveHarmonic(imgB, unk, rw, rh);
-  {
-    const band = Math.max(3, eyeW * 0.1);
-    for (let x = 0; x < rw; x++) {
-      let below = -1; // nearest known pixel below, scanning upwards
-      for (let y = rh - 1; y >= 0; y--) {
-        const j = y * rw + x;
-        if (!unk[j]) { below = y; continue; }
-        const db = below < 0 ? 1e9 : below - y;
-        const w = 1 - smooth(db / band); // 1 at the lower edge -> H1
-        for (let c = 0; c < 3; c++) img3[j * 3 + c] = lerp(imgB[j * 3 + c], img3[j * 3 + c], w);
+    const sm = boxBlur(ref, bw, 1, 3, Math.max(3, Math.round(eyeW * 0.12)));
+    for (let x = 0; x < bw; x++) {
+      if (botY[x] < 0) continue;
+      for (let y = botY[x] + 1; y < bh; y++) {
+        const j = y * bw + x;
+        for (let c = 0; c < 3; c++) H2[j * 3 + c] = sm[x * 3 + c];
       }
     }
   }
-
-
-  // 2) Skin texture: copy fine detail (pores, freckles, grain) from the
-  //    forehead right above the brows onto the smooth base.
-  const R = Math.max(2, Math.round(eyeW * 0.03));
-  const shiftUp = (y1 - y0) + Math.round(eyeW * 0.12);
-  const detail = (x, y, c) => {
-    let sum = 0, n = 0;
-    for (let oy = -R; oy <= R; oy++) {
-      const yy = y + oy; if (yy < 0 || yy >= H) continue;
-      for (let ox = -R; ox <= R; ox++) {
-        const xx = x + ox; if (xx < 0 || xx >= W) continue;
-        sum += d[(yy * W + xx) * 4 + c]; n++;
-      }
-    }
-    return d[(y * W + x) * 4 + c] - sum / n;
-  };
-  // Only copy from clean skin: skip edges (fingers, hairline, stray hairs)
-  // and fall back to fine grain of matching strength.
-  const rndT = mulberry32(99);
-  let grainSum = 0, grainN = 0;
-  const lumDetail = (x, y) => 0.299 * detail(x, y, 0) + 0.587 * detail(x, y, 1) + 0.114 * detail(x, y, 2);
-  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
-    const j2 = y * rw + x;
-    if (!unk[j2]) continue;
-    const ix = x + rx0, iy = y + ry0;
-    let done = false;
-    for (const f of [1, 0.75, 1.3, 0.55]) {
-      const sy = iy - Math.round(shiftUp * f);
-      if (sy < R || inMask(ix, sy)) continue;
-      const k = (sy * W + ix) * 4;
-      if (Math.abs(lum(d[k], d[k + 1], d[k + 2]) - skinLum) > 45) continue;
-      const L = lumDetail(ix, sy);
-      if (Math.abs(L) > 12) continue;
-      for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += clamp(detail(ix, sy, c), -14, 14) * 0.85;
-      grainSum += Math.abs(L); grainN++;
-      done = true; break;
-    }
-    if (!done) {
-      const g = (grainN ? grainSum / grainN : 3) * 1.1;
-      const n = (rndT() + rndT() + rndT() - 1.5) * g;
-      for (let c = 0; c < 3; c++) img3[j2 * 3 + c] += n;
+  solveHarmonic(H1, mask, bw, bh);
+  solveHarmonic(H2, mask, bw, bh);
+  const base = new Float32Array(N * 3);
+  const band = Math.max(3, eyeW * 0.05);
+  for (let x = 0; x < bw; x++) {
+    for (let y = 0; y < bh; y++) {
+      const j = y * bw + x;
+      if (!mask[j]) continue;
+      // distance to the nearest known pixel below in this column
+      let db = 1e9;
+      for (let yy = y + 1; yy < bh; yy++) if (!mask[yy * bw + x]) { db = yy - y; break; }
+      const w = 1 - smooth(db / band);
+      for (let c = 0; c < 3; c++) base[j * 3 + c] = lerp(H2[j * 3 + c], H1[j * 3 + c], w);
     }
   }
 
-  const filled = makeCanvas(W, H);
-  const fctx = filled.getContext('2d');
-  const out = fctx.createImageData(W, H);
+  // ---- 2b. skin texture, copied block-by-block from clean skin ----
+  const R = Math.max(2, Math.round(eyeW * 0.025));
+  const blurred = boxBlur(rgb, bw, bh, 3, R);
+  const Lbig = boxBlur(L, bw, bh, 1, Math.max(4, Math.round(eyeW * 0.08)));
+  const good = new Uint8Array(N);
+  for (let j = 0; j < N; j++) {
+    good[j] = oval[j] && !nearBrow[j] && Math.abs(L[j] - Lbig[j]) < 28 && L[j] > Lbig[j] * 0.72 ? 1 : 0;
+  }
+  const B = Math.max(8, Math.round(eyeW * 0.14)), S = Math.max(4, B >> 1);
+  const tex = new Float32Array(N * 3), tw = new Float32Array(N);
+  const rnd = mulberry32(4242);
+  let mx0 = bw, mx1 = 0, my0 = bh, my1 = 0;
+  for (let j = 0; j < N; j++) if (mask[j]) { const x = j % bw, y = (j / bw) | 0; if (x < mx0) mx0 = x; if (x > mx1) mx1 = x; if (y < my0) my0 = y; if (y > my1) my1 = y; }
+  for (let ty = my0 - S; ty <= my1; ty += S) for (let tx = mx0 - S; tx <= mx1; tx += S) {
+    // does this block touch the mask?
+    let touches = false;
+    for (let y = Math.max(0, ty); y < Math.min(bh, ty + B) && !touches; y += 2)
+      for (let x = Math.max(0, tx); x < Math.min(bw, tx + B); x += 2) if (mask[y * bw + x]) { touches = true; break; }
+    if (!touches) continue;
+    // pick the cleanest nearby source block (prefer close, above)
+    let best = null, bestScore = -1;
+    for (let k = 0; k < 40; k++) {
+      const sx = Math.round(tx + (rnd() - 0.5) * eyeW * 0.9);
+      const sy = Math.round(ty - eyeW * (0.25 + rnd() * 0.75));
+      if (sx < 0 || sy < 0 || sx + B > bw || sy + B > bh) continue;
+      let ok = 0, n = 0;
+      for (let y = 0; y < B; y += 2) for (let x = 0; x < B; x += 2) { ok += good[(sy + y) * bw + sx + x]; n++; }
+      const score = ok / n - Math.abs(sx - tx) / (eyeW * 6);
+      if (score > bestScore) { bestScore = score; best = [sx, sy]; }
+      if (ok === n && k > 10) break;
+    }
+    if (!best || bestScore < 0.6) continue;
+    const [sx, sy] = best;
+    for (let y = 0; y < B; y++) for (let x = 0; x < B; x++) {
+      const X = tx + x, Y = ty + y;
+      if (X < 0 || Y < 0 || X >= bw || Y >= bh || !mask[Y * bw + X]) continue;
+      const sj = (sy + y) * bw + sx + x;
+      if (!good[sj]) continue;
+      const wgt = (1 - Math.abs((x + 0.5) / B * 2 - 1)) * (1 - Math.abs((y + 0.5) / B * 2 - 1)) + 1e-3;
+      const tj = Y * bw + X;
+      const gain = clamp(lum(base[tj * 3], base[tj * 3 + 1], base[tj * 3 + 2]) / Math.max(30, Lbig[sj]), 0.6, 1.4);
+      for (let c = 0; c < 3; c++) tex[tj * 3 + c] += clamp(rgb[sj * 3 + c] - blurred[sj * 3 + c], -45, 45) * gain * wgt;
+      tw[tj] += wgt;
+    }
+  }
+  // fallback grain where no clean source was found
+  let grain = 0, gn = 0;
+  for (let j = 0; j < N; j += 3) if (good[j]) { grain += Math.abs(L[j] - lum(blurred[j * 3], blurred[j * 3 + 1], blurred[j * 3 + 2])); gn++; }
+  grain = gn ? grain / gn : 3;
+
+  // ---- compose with a 1–2 px feathered edge ----
+  const alpha = boxBlur(Float32Array.from(mask), bw, bh, 1, 1);
+  const out = sctx.createImageData(W, H);
   out.data.set(d);
-  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
-    const j2 = y * rw + x;
-    if (!unk[j2]) continue;
-    const k = ((y + ry0) * W + (x + rx0)) * 4;
-    out.data[k] = img3[j2 * 3]; out.data[k + 1] = img3[j2 * 3 + 1]; out.data[k + 2] = img3[j2 * 3 + 2];
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const j = y * bw + x;
+    const a = mask[j] ? 1 : alpha[j];
+    if (a <= 0) continue;
+    const k = ((y + by0) * W + (x + bx0)) * 4;
+    let fill;
+    if (mask[j]) {
+      fill = [0, 1, 2].map((c) => base[j * 3 + c] + (tw[j] > 0 ? tex[j * 3 + c] / tw[j] : (rnd() + rnd() - 1) * grain * 1.2));
+    } else {
+      // just outside the mask: soften the seam with the neighbouring fill
+      fill = [d[k], d[k + 1], d[k + 2]];
+    }
+    for (let c = 0; c < 3; c++) out.data[k + c] = lerp(d[k + c], fill[c], a);
   }
-  fctx.putImageData(out, 0, 0);
-
-  // 3) Narrow feather so there is no visible seam.
-  const feather = makeCanvas(W, H);
-  const fe = feather.getContext('2d');
-  fe.filter = `blur(${Math.max(1, eyeW * 0.015)}px)`;
-  fe.drawImage(mask, 0, 0);
-  fctx.globalCompositeOperation = 'destination-in';
-  fctx.drawImage(feather, 0, 0);
-  fctx.globalCompositeOperation = 'source-over';
-
   const result = makeCanvas(W, H);
-  const rctx = result.getContext('2d');
-  rctx.drawImage(src, 0, 0);
-  rctx.drawImage(filled, 0, 0);
-  if (window.__brow) window.__brow.lastRemoveMs = Math.round(performance.now() - t0);
+  result.getContext('2d').putImageData(out, 0, 0);
 
-  // Hair colour estimate.
+  // debug / test hook: the final mask in image space
+  if (window.__brow) {
+    const mc = makeCanvas(W, H), mg = mc.getContext('2d'), md = mg.createImageData(bw, bh);
+    for (let j = 0; j < N; j++) if (mask[j]) { md.data[j * 4] = md.data[j * 4 + 1] = md.data[j * 4 + 2] = 255; md.data[j * 4 + 3] = 255; }
+    mg.putImageData(md, bx0, by0);
+    window.__brow.lastMask = mc;
+    window.__brow.lastRemoveMs = Math.round(performance.now() - t0);
+  }
+
+  // ---- hair colour from the darkest brow pixels ----
   let hair = null;
-  if (browPx.length > 20) {
-    browPx.sort((a, b) => a[3] - b[3]);
-    const n = Math.max(5, Math.floor(browPx.length * 0.25));
-    let rr = 0, gg = 0, bb = 0;
-    for (let i = 0; i < n; i++) { rr += browPx[i][0]; gg += browPx[i][1]; bb += browPx[i][2]; }
-    const c = { r: rr / n, g: gg / n, b: bb / n };
-    const skin = sample(Math.round((x0 + x1) / 2), y0, 0, -1);
-    const contrast = skin ? lum(...skin) - lum(c.r, c.g, c.b) : 0;
-    if (contrast > 45) {
-      // deepen slightly: drawn brows read lighter than real hair
-      hair = rgbToHex({ r: c.r * 0.72, g: c.g * 0.7, b: c.b * 0.68 });
-    } else if (skin) {
-      // no real brows: a soft brown derived from skin tone
-      hair = rgbToHex({ r: skin[0] * 0.12 + 22, g: skin[1] * 0.09 + 14, b: skin[2] * 0.07 + 10 });
+  {
+    const px = [];
+    let sr = 0, sg = 0, sb = 0, sn = 0;
+    for (let j = 0; j < N; j++) {
+      if (!coreShape[j]) continue;
+      px.push([rgb[j * 3], rgb[j * 3 + 1], rgb[j * 3 + 2], L[j]]);
+      sr += H1[j * 3]; sg += H1[j * 3 + 1]; sb += H1[j * 3 + 2]; sn++;
+    }
+    if (px.length > 20 && sn) {
+      px.sort((a, b) => a[3] - b[3]);
+      const n = Math.max(5, Math.floor(px.length * 0.25));
+      let rr = 0, gg = 0, bb = 0;
+      for (let i = 0; i < n; i++) { rr += px[i][0]; gg += px[i][1]; bb += px[i][2]; }
+      const c = { r: rr / n, g: gg / n, b: bb / n };
+      const skinC = [sr / sn, sg / sn, sb / sn];
+      if (lum(...skinC) - lum(c.r, c.g, c.b) > 45) hair = rgbToHex({ r: c.r * 0.72, g: c.g * 0.7, b: c.b * 0.68 });
+      else hair = rgbToHex({ r: skinC[0] * 0.12 + 22, g: skinC[1] * 0.09 + 14, b: skinC[2] * 0.07 + 10 });
+      const hc = hexToRgb(hair), HL = lum(hc.r, hc.g, hc.b);
+      if (HL > 70) { const k = 70 / HL; hair = rgbToHex({ r: hc.r * k, g: hc.g * k, b: hc.b * k }); }
     }
   }
-  // faint or very light brows give a washed-out colour: keep it deep enough to read
-  if (hair) {
-    const c = hexToRgb(hair), L = lum(c.r, c.g, c.b);
-    if (L > 70) { const k = 70 / L; hair = rgbToHex({ r: c.r * k, g: c.g * k, b: c.b * k }); }
+  return { canvas: result, hair, brow: { mask, bx0, by0, bw, bh } };
+}
+
+
+/* ------------------------------ AI inpainting ------------------------------
+ * MI-GAN (Picsart AI Research, MIT licence) running on onnxruntime-web.
+ * It repaints the brow area as skin using the whole face as context. The
+ * model ships in two parts (hosting limit of 25 MB per file).
+ * -------------------------------------------------------------------------- */
+let miganPromise = null;
+function getMigan() {
+  if (!miganPromise) {
+    miganPromise = (async () => {
+      ort.env.wasm.wasmPaths = new URL('./vendor/ort/', import.meta.url).href;
+      ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+      const parts = await Promise.all(['migan.part0', 'migan.part1'].map(async (f) => {
+        const r = await fetch(new URL('./models/' + f, import.meta.url));
+        if (!r.ok) throw new Error('model download failed');
+        return new Uint8Array(await r.arrayBuffer());
+      }));
+      const buf = new Uint8Array(parts[0].length + parts[1].length);
+      buf.set(parts[0], 0); buf.set(parts[1], parts[0].length);
+      return ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+    })();
+    miganPromise.catch(() => { miganPromise = null; });
   }
-  return { canvas: result, hair };
+  return miganPromise;
+}
+
+// Repaints the brow mask with MI-GAN, one brow at a time.
+async function aiRemoveBrows(src, brow, face) {
+  const { W, H } = state;
+  const { mask, bx0, by0, bw, bh } = brow;
+  const session = await getMigan();
+  // a little extra margin around the hair for the model
+  const m2 = dilateMask(mask, bw, bh, Math.max(2, Math.round(face.eyeW * 0.025)));
+  const sctx = src.getContext('2d', { willReadFrequently: true });
+  const img = sctx.getImageData(0, 0, W, H);
+  const d = img.data;
+  const midX = face.midX - bx0;
+  const runMask = async (holeAt) => { // holeAt(x, y) in box coords
+    const known = new Uint8Array(W * H).fill(255);
+    let any = false;
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      if (!holeAt(x, y)) continue;
+      known[(y + by0) * W + (x + bx0)] = 0; any = true;
+    }
+    if (!any) return;
+    const chw = new Uint8Array(3 * W * H);
+    for (let k = 0; k < W * H; k++) { chw[k] = d[k * 4]; chw[W * H + k] = d[k * 4 + 1]; chw[2 * W * H + k] = d[k * 4 + 2]; }
+    const out = await session.run({
+      image: new ort.Tensor('uint8', chw, [1, 3, H, W]),
+      mask: new ort.Tensor('uint8', known, [1, 1, H, W]),
+    });
+    const r = out.result.data;
+    // composite with a 1 px soft edge
+    for (let y = Math.max(1, by0); y < Math.min(H - 1, by0 + bh); y++) for (let x = Math.max(1, bx0); x < Math.min(W - 1, bx0 + bw); x++) {
+      const k = y * W + x;
+      let a;
+      if (!known[k]) a = 1;
+      else {
+        let n = 0;
+        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) if (!known[k + oy * W + ox]) n++;
+        a = n / 9 * 0.6;
+      }
+      if (a <= 0) continue;
+      for (let c = 0; c < 3; c++) d[k * 4 + c] = lerp(d[k * 4 + c], r[c * W * H + k], a);
+    }
+  };
+  // one brow at a time (more resolution, cleaner context)
+  await runMask((x, y) => m2[y * bw + x] && x < midX);
+  await runMask((x, y) => m2[y * bw + x] && x >= midX);
+  // safety pass: hair-like dark specks left (or invented) inside the brow area
+  for (let pass = 0; pass < 2; pass++) {
+    const Lr = new Float32Array(bw * bh);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const k = ((y + by0) * W + (x + bx0)) * 4;
+      Lr[y * bw + x] = lum(d[k], d[k + 1], d[k + 2]);
+    }
+    const Lb = boxBlur(Lr, bw, bh, 1, Math.max(3, Math.round(face.eyeW * 0.06)));
+    const spots = new Uint8Array(bw * bh);
+    let cnt = 0;
+    for (let k = 0; k < bw * bh; k++) {
+      if (m2[k] && Lr[k] < Lb[k] - Math.max(14, Lb[k] * 0.09)) { spots[k] = 1; cnt++; }
+    }
+    if (cnt < 3) break;
+    const sm = dilateMask(spots, bw, bh, Math.max(2, Math.round(face.eyeW * 0.03)));
+    await runMask((x, y) => sm[y * bw + x] && x < midX);
+    await runMask((x, y) => sm[y * bw + x] && x >= midX);
+  }
+  const result = makeCanvas(W, H);
+  result.getContext('2d').putImageData(img, 0, 0);
+  return result;
 }
 
 /* ------------------------------ brow mapping ------------------------------ */
@@ -1088,8 +1444,18 @@ async function loadFile(file) {
     state.face = buildFace(res.faceLandmarks[0], W, H);
     setStatus('Removing brows…');
     await new Promise((r) => setTimeout(r, 30));
-    const { canvas, hair } = removeBrows(orig, state.face);
+    const { canvas, hair, brow } = removeBrows(orig, state.face);
     state.clean = canvas;
+    // AI repaint (better skin, shading and texture); the classic fill stays as fallback
+    try {
+      setStatus('Removing brows (AI)…');
+      const t0 = performance.now();
+      state.clean = await aiRemoveBrows(orig, brow, state.face);
+      if (window.__brow) window.__brow.aiMs = Math.round(performance.now() - t0);
+    } catch (e) {
+      console.warn('AI brow removal unavailable, using classic fill', e);
+      if (window.__brow) window.__brow.aiError = String(e && e.message || e);
+    }
     if (hair) els.color.value = hair;
     syncOutputs();
     state.brows = mapBrows(state.face, settings());
@@ -1166,6 +1532,7 @@ els.newPhoto.addEventListener('click', () => { els.file.value = ''; els.file.cli
 
 syncOutputs();
 getLandmarker().catch(() => {}); // warm up while the user picks a photo
+getMigan().catch(() => {});
 
 // test hook: render any moment of the animation
 window.__brow = { seek: (t) => { state.playing = false; render(t); }, state };
