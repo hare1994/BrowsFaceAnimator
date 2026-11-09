@@ -708,76 +708,104 @@ function makeStrokes(face, geo, s) {
  * the original brow hair (darker half of the brow pixels), render the new
  * brows off-screen, measure them the same way, adjust the tint, repeat.
  * --------------------------------------------------------------------------- */
-function darkerHalfMean(pixels) { // pixels: array of [r,g,b,lum]; mean of the darkest quarter
-  if (pixels.length < 20) return null;
-  pixels.sort((a, b) => a[3] - b[3]);
-  const n = Math.max(10, Math.floor(pixels.length * 0.25)); // the hair itself, not the skin between
-  let r = 0, g = 0, b = 0;
-  for (let i = 0; i < n; i++) { r += pixels[i][0]; g += pixels[i][1]; b += pixels[i][2]; }
-  return [r / n, g / n, b / n];
-}
+// Colour matching compares the overall look of the two brows: the mean colour
+// over each brow's footprint (hair plus the skin showing between hairs).
+// Old brow: pixels inside the erase mask that the brow darkened by > 10 levels.
+// New brow: pixels the new brow covers (fixed area, so the match converges).
 function originalBrowColour() {
   const info = state.browInfo;
-  if (!info) return null;
+  if (!info || !state.clean) return null;
   const { mask, bx0, by0, bw, bh } = info;
-  const d = state.orig.getContext('2d', { willReadFrequently: true }).getImageData(bx0, by0, bw, bh).data;
+  const a = state.orig.getContext('2d', { willReadFrequently: true }).getImageData(bx0, by0, bw, bh).data;
+  const b = state.clean.getContext('2d', { willReadFrequently: true }).getImageData(bx0, by0, bw, bh).data;
   const px = [];
-  for (let k = 0; k < bw * bh; k++) if (mask[k]) px.push([d[k * 4], d[k * 4 + 1], d[k * 4 + 2], lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2])]);
-  return darkerHalfMean(px);
+  for (let k = 0; k < bw * bh; k++) {
+    if (!mask[k]) continue;
+    const la = lum(a[k * 4], a[k * 4 + 1], a[k * 4 + 2]);
+    if (lum(b[k * 4], b[k * 4 + 1], b[k * 4 + 2]) - la < 10) continue;
+    px.push([a[k * 4], a[k * 4 + 1], a[k * 4 + 2], la]);
+  }
+  return colourStats(px);
+}
+// overall look (mean) and the hair itself (mean of the darkest quarter)
+function colourStats(px) {
+  if (px.length < 30) return null;
+  let r = 0, g = 0, b = 0;
+  for (const p of px) { r += p[0]; g += p[1]; b += p[2]; }
+  const mean = [r / px.length, g / px.length, b / px.length];
+  px.sort((p, q) => p[3] - q[3]);
+  const m = Math.max(10, Math.floor(px.length * 0.25));
+  r = g = b = 0;
+  for (let i = 0; i < m; i++) { r += px[i][0]; g += px[i][1]; b += px[i][2]; }
+  return { mean, hair: [r / m, g / m, b / m] };
 }
 function renderedBrowColour(hex) {
   const { W, H } = state;
-  const layer = makeCanvas(W, H), g = layer.getContext('2d', { willReadFrequently: true });
-  g.save(); faceTransform(g); g.imageSmoothingQuality = 'high';
-  drawNaturalBrows(g, state.brows, state.face, hex, 1);
-  g.restore();
-  // only the area the brows cover
+  const SS = Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
+  const big = makeCanvas(W * SS, H * SS), bg = big.getContext('2d');
+  bg.setTransform(SS, 0, 0, SS, 0, 0); faceTransform(bg); bg.imageSmoothingQuality = 'high';
+  drawNaturalBrows(bg, state.brows, state.face, hex, 1, 1);
+  const layer = makeCanvas(W, H), lg = layer.getContext('2d', { willReadFrequently: true });
+  lg.imageSmoothingQuality = 'high';
+  lg.drawImage(big, 0, 0, W, H);
+  const comp = makeCanvas(W, H), cg = comp.getContext('2d', { willReadFrequently: true });
+  cg.drawImage(state.clean, 0, 0);
+  cg.drawImage(layer, 0, 0);
   let x0 = W, y0 = H, x1 = 0, y1 = 0;
   for (const side of state.brows.sides) for (const p0 of side.outline) {
     const q = faceToImage(p0);
     x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y);
   }
-  const pad = state.face.eyeW * 0.2;
+  const pad = state.face.eyeW * 0.25;
   x0 = Math.max(0, Math.floor(x0 - pad)); y0 = Math.max(0, Math.floor(y0 - pad));
   x1 = Math.min(W, Math.ceil(x1 + pad)); y1 = Math.min(H, Math.ceil(y1 + pad));
   const w = x1 - x0, h = y1 - y0;
   if (w <= 0 || h <= 0) return null;
-  const la = g.getImageData(x0, y0, w, h).data;
-  const comp = makeCanvas(w, h), cg = comp.getContext('2d', { willReadFrequently: true });
-  cg.drawImage(state.clean, x0, y0, w, h, 0, 0, w, h);
-  cg.drawImage(layer, x0, y0, w, h, 0, 0, w, h);
-  const cd = cg.getImageData(0, 0, w, h).data;
+  const al = lg.getImageData(x0, y0, w, h).data, c = cg.getImageData(x0, y0, w, h).data;
   const px = [];
-  for (let k = 0; k < w * h; k++) if (la[k * 4 + 3] > 64) px.push([cd[k * 4], cd[k * 4 + 1], cd[k * 4 + 2], lum(cd[k * 4], cd[k * 4 + 1], cd[k * 4 + 2])]);
-  return darkerHalfMean(px);
+  for (let k = 0; k < w * h; k++) {
+    if (al[k * 4 + 3] < 64) continue;
+    px.push([c[k * 4], c[k * 4 + 1], c[k * 4 + 2], lum(c[k * 4], c[k * 4 + 1], c[k * 4 + 2])]);
+  }
+  return colourStats(px);
 }
 function faceToImage(q) { // inverse of face.F
   const { C, angle } = state.face;
   const c = Math.cos(angle), s = Math.sin(angle);
   return pt(C.x + (q.x - C.x) * c - (q.y - C.y) * s, C.y + (q.x - C.x) * s + (q.y - C.y) * c);
 }
+// Finds the tint for which the new brows' `key` measurement equals the old one.
+function solveTint(start, target, key) {
+  let col = { ...start };
+  for (let it = 0; it < 8; it++) {
+    const got = renderedBrowColour(rgbToHex(col));
+    if (!got) return null;
+    const g = got[key], t = target[key];
+    if (Math.abs(g[0] - t[0]) + Math.abs(g[1] - t[1]) + Math.abs(g[2] - t[2]) < 3) break;
+    // the visible colour is a blend of hair and skin: step a bit further than the gap
+    col = { r: clamp(col.r + (t[0] - g[0]) * 1.6, 0, 255), g: clamp(col.g + (t[1] - g[1]) * 1.6, 0, 255), b: clamp(col.b + (t[2] - g[2]) * 1.6, 0, 255) };
+  }
+  return col;
+}
+// The eye judges a brow both by its hairs and by its overall look: the hairs
+// alone made dense new brows look too dark, the overall average made very dark
+// brows look too light. The tint is the midpoint of the two exact matches.
 function matchBrowColour() {
   if (!browTpl.meta) return null;
   const target = originalBrowColour();
   if (!target) return null;
-  let col = hexToRgb(els.color.value);
-  let got = null;
-  for (let it = 0; it < 4; it++) {
-    got = renderedBrowColour(rgbToHex(col));
-    if (!got) return null;
-    const err = Math.abs(got[0] - target[0]) + Math.abs(got[1] - target[1]) + Math.abs(got[2] - target[2]);
-    if (err < 4) break;
-    col = {
-      r: clamp(col.r * clamp(target[0] / Math.max(1, got[0]), 0.5, 2), 0, 255),
-      g: clamp(col.g * clamp(target[1] / Math.max(1, got[1]), 0.5, 2), 0, 255),
-      b: clamp(col.b * clamp(target[2] / Math.max(1, got[2]), 0.5, 2), 0, 255),
-    };
-  }
+  const start = hexToRgb(els.color.value);
+  const byHair = solveTint(start, target, 'hair');
+  const byLook = solveTint(start, target, 'mean');
+  if (!byHair || !byLook) return null;
+  const col = { r: (byHair.r + byLook.r) / 2, g: (byHair.g + byLook.g) / 2, b: (byHair.b + byLook.b) / 2 };
   const hex = rgbToHex(col);
   els.color.value = hex;
-  // drop tints made during matching
+  state.browOpacity = 1;
   for (const k of [...browTpl.tinted.keys()]) if (k !== hex) browTpl.tinted.delete(k);
-  const res = { target: target.map(Math.round), rendered: renderedBrowColour(hex).map(Math.round), hex };
+  const fin = renderedBrowColour(hex);
+  const R = (v) => v.map(Math.round);
+  const res = { hex, target: { hair: R(target.hair), mean: R(target.mean) }, rendered: { hair: R(fin.hair), mean: R(fin.mean) } };
   if (window.__brow) window.__brow.colour = res;
   return res;
 }
@@ -1022,7 +1050,7 @@ function drawTri(g, img, s0, s1, s2, d0, d1, d2) {
 }
 
 // warps the template onto both brows; reveal 0..1 grows them head -> tail
-function drawNaturalBrows(g, geo, face, hex, reveal) {
+function drawNaturalBrows(g, geo, face, hex, reveal, opacity = state.browOpacity || 1) {
   const meta = browTpl.meta;
   const [tpl, tplMirror] = tintedTemplate(hex);
   const NU = 40, VS = [-0.45, 0, 0.25, 0.5, 0.75, 1, 1.45];
@@ -1049,7 +1077,7 @@ function drawNaturalBrows(g, geo, face, hex, reveal) {
       // soft growing front (about a third of the brow wide) instead of a hard edge
       const a = smooth((reveal * 1.35 - u0) / 0.35);
       if (a <= 0) break;
-      g.globalAlpha = a;
+      g.globalAlpha = a * opacity;
       for (let j = 0; j < VS.length - 1; j++) {
         const v0 = VS[j], v1 = VS[j + 1];
         const S00 = src(u0, v0), S10 = src(u1, v0), S11 = src(u1, v1), S01 = src(u0, v1);
@@ -1076,7 +1104,7 @@ function drawBrows(c, progress) {
     if (!natLayer.cv || natLayer.cv.width !== W * SS || natLayer.cv.height !== H * SS) { natLayer.cv = makeCanvas(W * SS, H * SS); natLayer.key = null; }
     const reveal = clamp(progress * 1.08);
     const key = geo.strokes;
-    if (natLayer.key !== key || natLayer.color !== s.color || natLayer.reveal !== reveal) {
+    if (natLayer.key !== key || natLayer.color !== s.color || natLayer.reveal !== reveal || natLayer.op !== state.browOpacity) {
       const g = natLayer.cv.getContext('2d');
       g.setTransform(1, 0, 0, 1, 0, 0);
       g.clearRect(0, 0, natLayer.cv.width, natLayer.cv.height);
@@ -1086,7 +1114,7 @@ function drawBrows(c, progress) {
       g.imageSmoothingQuality = 'high';
       drawNaturalBrows(g, geo, state.face, s.color, reveal);
       g.restore();
-      natLayer.key = key; natLayer.color = s.color; natLayer.reveal = reveal;
+      natLayer.key = key; natLayer.color = s.color; natLayer.reveal = reveal; natLayer.op = state.browOpacity;
     }
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
@@ -1515,6 +1543,7 @@ async function loadFile(file) {
   const alive = () => myRun === loadRun;
   state.playing = false;
   state.browInfo = null;
+  state.browOpacity = 1;
   showAiNotice('');
   document.documentElement.dataset.browState = 'loading';
   els.intro.hidden = true;
