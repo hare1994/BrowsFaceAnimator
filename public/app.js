@@ -815,6 +815,7 @@ function drawGrid(c, alpha) {
 
 const layerCache = { hair: null, powder: null, mask: null, maskKey: '' };
 const hairLayer = { cv: null, key: null, drawn: 0 };
+const natLayer = { cv: null, key: null, color: '', reveal: -1 };
 
 function layerCanvas(key) {
   const { W, H } = state;
@@ -843,12 +844,177 @@ function browMask() {
   return cv;
 }
 
+/* ------------------------------ photo-real brows ------------------------------
+ * A real brow photo (transparent sprite, brows/natural-1.*) is recoloured to her
+ * hair colour and warped with a triangle mesh onto the mapped brow shape:
+ * head -> head, arch -> arch, tail -> tail, top/bottom edges -> the computed
+ * outline (so thickness, arch and length sliders still apply).
+ * --------------------------------------------------------------------------- */
+const browTpl = { img: null, meta: null, ready: null, tinted: new Map() };
+function loadBrowTemplate() {
+  if (!browTpl.ready) {
+    browTpl.ready = (async () => {
+      const meta = await (await fetch(new URL('./brows/natural-1.json', import.meta.url))).json();
+      const img = await new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i); i.onerror = () => rej(new Error('brow template failed to load'));
+        i.src = new URL('./brows/natural-1.webp', import.meta.url).href;
+      });
+      browTpl.meta = meta; browTpl.img = img;
+    })();
+    browTpl.ready.catch(() => { browTpl.ready = null; });
+  }
+  return browTpl.ready;
+}
+
+// template recoloured to `hex`, keeping the light/dark variation of real hair;
+// [normal, mirrored]
+function tintedTemplate(hex) {
+  if (browTpl.tinted.has(hex)) return browTpl.tinted.get(hex);
+  const { img } = browTpl;
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const c = makeCanvas(w, h), g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(img, 0, 0);
+  const id = g.getImageData(0, 0, w, h), d = id.data;
+  let sum = 0, n = 0;
+  for (let k = 0; k < d.length; k += 4) if (d[k + 3] > 140) { sum += lum(d[k], d[k + 1], d[k + 2]); n++; }
+  const mean = n ? sum / n : 60;
+  const col = hexToRgb(hex);
+  for (let k = 0; k < d.length; k += 4) {
+    if (!d[k + 3]) continue;
+    const r = clamp(lum(d[k], d[k + 1], d[k + 2]) / mean, 0.35, 2.6);
+    const shine = Math.max(0, r - 1.25) * 38; // keep the sheen on lighter hairs
+    d[k] = clamp(col.r * r + shine, 0, 255);
+    d[k + 1] = clamp(col.g * r + shine, 0, 255);
+    d[k + 2] = clamp(col.b * r + shine, 0, 255);
+  }
+  g.putImageData(id, 0, 0);
+  const m = makeCanvas(w, h), mg = m.getContext('2d');
+  mg.translate(w, 0); mg.scale(-1, 1); mg.drawImage(c, 0, 0);
+  const pair = [c, m];
+  browTpl.tinted.set(hex, pair);
+  return pair;
+}
+
+// top / bottom edge of a mapped brow at position u (0 head .. 1 tail), face frame
+function browEdges(side, geo, face, BINS = 64) {
+  const span = geo.tailHalf - geo.innerHalf;
+  const topB = new Float32Array(BINS + 1).fill(1e9), botB = new Float32Array(BINS + 1).fill(-1e9);
+  const ol = side.outline;
+  for (let i = 0; i < ol.length; i++) {
+    const p0 = ol[i], p1 = ol[(i + 1) % ol.length];
+    const steps = Math.max(1, Math.ceil(dist(p0, p1)));
+    for (let t = 0; t <= steps; t++) {
+      const px = lerp(p0.x, p1.x, t / steps), py = lerp(p0.y, p1.y, t / steps);
+      const b = Math.round(clamp((Math.abs(px - face.midX) - geo.innerHalf) / span) * BINS);
+      topB[b] = Math.min(topB[b], py); botB[b] = Math.max(botB[b], py);
+    }
+  }
+  for (let b = 0; b <= BINS; b++) if (topB[b] > 1e8) {
+    let l = b - 1, r = b + 1;
+    while (l >= 0 && topB[l] > 1e8) l--;
+    while (r <= BINS && topB[r] > 1e8) r++;
+    const src = l >= 0 ? l : r;
+    topB[b] = topB[src]; botB[b] = botB[src];
+  }
+  return { topB, botB, BINS };
+}
+
+// affine-map triangle (s0,s1,s2) of `img` onto (d0,d1,d2) in the current transform
+function drawTri(g, img, s0, s1, s2, d0, d1, d2) {
+  // grow the target triangle a hair so neighbouring triangles leave no seams
+  const cx = (d0.x + d1.x + d2.x) / 3, cy = (d0.y + d1.y + d2.y) / 3;
+  const grow = (p) => { const dx = p.x - cx, dy = p.y - cy, l = Math.hypot(dx, dy) || 1; return pt(p.x + dx / l * 0.6, p.y + dy / l * 0.6); };
+  const e0 = grow(d0), e1 = grow(d1), e2 = grow(d2);
+  g.save();
+  g.beginPath(); g.moveTo(e0.x, e0.y); g.lineTo(e1.x, e1.y); g.lineTo(e2.x, e2.y); g.closePath(); g.clip();
+  const den = s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+  if (Math.abs(den) < 1e-6) { g.restore(); return; }
+  const a = (d0.x * (s1.y - s2.y) + d1.x * (s2.y - s0.y) + d2.x * (s0.y - s1.y)) / den;
+  const b = (d0.y * (s1.y - s2.y) + d1.y * (s2.y - s0.y) + d2.y * (s0.y - s1.y)) / den;
+  const c = (d0.x * (s2.x - s1.x) + d1.x * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) / den;
+  const d = (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.y * (s1.x - s0.x)) / den;
+  const e = (d0.x * (s1.x * s2.y - s2.x * s1.y) + d1.x * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / den;
+  const f = (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.y * (s0.x * s1.y - s1.x * s0.y)) / den;
+  g.transform(a, b, c, d, e, f);
+  g.drawImage(img, 0, 0);
+  g.restore();
+}
+
+// warps the template onto both brows; reveal 0..1 grows them head -> tail
+function drawNaturalBrows(g, geo, face, hex, reveal) {
+  const meta = browTpl.meta;
+  const [tpl, tplMirror] = tintedTemplate(hex);
+  const NU = 40, VS = [-0.45, 0, 0.25, 0.5, 0.75, 1, 1.45];
+  const span = geo.tailHalf - geo.innerHalf;
+  const tS = (u) => { const f = u * 64, i = Math.min(63, Math.floor(f)), t = f - i; return [lerp(meta.top[i], meta.top[i + 1], t), lerp(meta.bot[i], meta.bot[i + 1], t)]; };
+  for (const side of geo.sides) {
+    const { topB, botB, BINS } = browEdges(side, geo, face);
+    const tE = (u) => { const f = u * BINS, i = Math.min(BINS - 1, Math.floor(f)), t = f - i; return [lerp(topB[i], topB[i + 1], t), lerp(botB[i], botB[i + 1], t)]; };
+    // the template's head is on the right of its image (a brow on the image-left side)
+    const mirror = side.sg > 0;
+    const img = mirror ? tplMirror : tpl;
+    const src = (u, v) => {
+      const [t, b] = tS(u);
+      let x = lerp(meta.headX, meta.tailX, u);
+      if (mirror) x = meta.w - x;
+      return pt(x, b - v * (b - t));
+    };
+    const dst = (u, v) => {
+      const [t, b] = tE(u);
+      return pt(face.midX + side.sg * (geo.innerHalf + u * span), b - v * (b - t));
+    };
+    for (let i = 0; i < NU; i++) {
+      const u0 = i / NU, u1 = (i + 1) / NU;
+      // soft growing front (about a third of the brow wide) instead of a hard edge
+      const a = smooth((reveal * 1.35 - u0) / 0.35);
+      if (a <= 0) break;
+      g.globalAlpha = a;
+      for (let j = 0; j < VS.length - 1; j++) {
+        const v0 = VS[j], v1 = VS[j + 1];
+        const S00 = src(u0, v0), S10 = src(u1, v0), S11 = src(u1, v1), S01 = src(u0, v1);
+        const D00 = dst(u0, v0), D10 = dst(u1, v0), D11 = dst(u1, v1), D01 = dst(u0, v1);
+        drawTri(g, img, S00, S10, S11, D00, D10, D11);
+        drawTri(g, img, S00, S11, S01, D00, D11, D01);
+      }
+    }
+    g.globalAlpha = 1;
+  }
+}
+
 function drawBrows(c, progress) {
   if (progress <= 0) return;
   const s = settings();
   const geo = state.brows;
   const rgb = hexToRgb(s.color);
   const eyeW = state.face.eyeW;
+
+  if (s.style === 'natural' && browTpl.meta) {
+    // photo-real: cached at 2x, redrawn only while growing in or after a change
+    const { W, H } = state;
+    const SS = Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
+    if (!natLayer.cv || natLayer.cv.width !== W * SS || natLayer.cv.height !== H * SS) { natLayer.cv = makeCanvas(W * SS, H * SS); natLayer.key = null; }
+    const reveal = clamp(progress * 1.08);
+    const key = geo.strokes;
+    if (natLayer.key !== key || natLayer.color !== s.color || natLayer.reveal !== reveal) {
+      const g = natLayer.cv.getContext('2d');
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, natLayer.cv.width, natLayer.cv.height);
+      g.save();
+      g.setTransform(SS, 0, 0, SS, 0, 0);
+      faceTransform(g);
+      g.imageSmoothingQuality = 'high';
+      drawNaturalBrows(g, geo, state.face, s.color, reveal);
+      g.restore();
+      natLayer.key = key; natLayer.color = s.color; natLayer.reveal = reveal;
+    }
+    c.save();
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(natLayer.cv, 0, 0, W, H);
+    c.restore();
+    return;
+  }
 
   if (s.style !== 'strokes') {
     // powder: soft ombré tint, multiplied so skin texture shows through
@@ -1378,6 +1544,8 @@ async function loadFile(file) {
     if (aiFailed) showAiNotice('AI erase failed, so a basic erase was used. Reason: ' + (window.__brow && window.__brow.aiError || 'unknown') + '. Open this page with ?diag=1 at the end of the address for a full check.');
     if (hair) els.color.value = hair;
     syncOutputs();
+    try { await loadBrowTemplate(); } catch { if (els.style.value === 'natural') els.style.value = 'strokes'; }
+    if (!alive()) return;
     state.brows = mapBrows(state.face, settings());
     state.timeline = buildTimeline(state.face, state.brows);
     play();
@@ -1506,6 +1674,7 @@ els.newPhoto.addEventListener('click', () => { els.file.value = ''; els.file.cli
 syncOutputs();
 getLandmarker().catch(() => {}); // warm up while the user picks a photo
 getMigan().catch(() => {});
+loadBrowTemplate().catch(() => {});
 
 // test hook: render any moment of the animation
 window.__brow = { seek: (t) => { state.playing = false; render(t); }, state,

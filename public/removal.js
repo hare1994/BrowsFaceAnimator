@@ -647,10 +647,10 @@ export function removeBrowsData(d, W, H, P, eyeW) {
       for (let i = 0; i < n; i++) { rr += px[i][0]; gg += px[i][1]; bb += px[i][2]; }
       const c = { r: rr / n, g: gg / n, b: bb / n };
       const skinC = [sr / sn, sg / sn, sb / sn];
-      if (lum(...skinC) - lum(c.r, c.g, c.b) > 45) hair = rgbToHex({ r: c.r * 0.72, g: c.g * 0.7, b: c.b * 0.68 });
+      if (lum(...skinC) - lum(c.r, c.g, c.b) > 45) hair = rgbToHex({ r: c.r * 0.86, g: c.g * 0.84, b: c.b * 0.82 });
       else hair = rgbToHex({ r: skinC[0] * 0.12 + 22, g: skinC[1] * 0.09 + 14, b: skinC[2] * 0.07 + 10 });
       const hc = hexToRgb(hair), HL = lum(hc.r, hc.g, hc.b);
-      if (HL > 70) { const k = 70 / HL; hair = rgbToHex({ r: hc.r * k, g: hc.g * k, b: hc.b * k }); }
+      if (HL > 95) { const k = 95 / HL; hair = rgbToHex({ r: hc.r * k, g: hc.g * k, b: hc.b * k }); }
     }
   }
   return { out: out.data, hair, mask, bx0, by0, bw, bh, dbg: { bandTop: Array.from(bandTop), bandBot: Array.from(bandBot), floorAt: Array.from(floorAt), lowLine: Array.from(lowLine) } };
