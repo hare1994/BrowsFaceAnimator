@@ -35,6 +35,13 @@
     <section id="studio" class="studio" hidden>
       <div class="stage-wrap">
         <canvas id="stage" aria-label="Brow mapping animation"></canvas>
+        <div class="stage-tools">
+          <button id="replay" class="tool primary" disabled aria-label="Replay the animation">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.4-5.7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M4 4v4.5h4.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Replay</span>
+          </button>
+          <button id="compare" class="tool" disabled title="Hold to see the original">Hold: original</button>
+        </div>
         <div class="caption" id="caption"></div>
         <div class="status" id="status" role="status"></div>
         <div class="busy" id="busy" hidden aria-live="polite">
@@ -45,11 +52,6 @@
       </div>
 
       <aside class="panel card" id="panel">
-        <div class="row buttons">
-          <button id="replay" class="btn primary" disabled>Replay</button>
-          <button id="compare" class="btn" disabled title="Hold to see the original">Hold: original</button>
-        </div>
-
         <fieldset class="controls" id="controls" disabled>
           <legend>Shape</legend>
           <label>Thickness <output id="thickV"></output>

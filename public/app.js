@@ -1225,14 +1225,15 @@ function drawOutline(c, side, frac, color, lw, alpha) {
   c.restore();
 }
 
-function render(t) {
+// c: target canvas context (the stage by default; an off-screen one when
+// saving a video). opts.burnCaption draws the caption into the picture.
+function render(t, c = ctx, opts = {}) {
   const { W, H, face } = state;
   const tl = state.timeline;
-  const c = ctx;
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.clearRect(0, 0, W, H);
 
-  if (state.showOriginal) {
+  if (state.showOriginal && c === ctx) {
     c.drawImage(state.orig, 0, 0);
     return;
   }
@@ -1297,7 +1298,98 @@ function render(t) {
   // caption
   let cap = '';
   for (const [ct, text] of tl.captions) if (t >= ct) cap = text;
-  if (els.caption.textContent !== cap) els.caption.textContent = cap;
+  if (opts.burnCaption) burnCaption(c, cap);
+  else if (c === ctx && els.caption.textContent !== cap) els.caption.textContent = cap;
+}
+
+function burnCaption(c, text) {
+  if (!text) return;
+  const { W, H } = state;
+  const size = Math.round(Math.max(14, Math.min(W, H) * 0.038));
+  c.save();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.font = `700 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  c.textAlign = 'center'; c.textBaseline = 'bottom';
+  c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = size * 0.5;
+  c.fillStyle = '#fff';
+  c.fillText(text, W / 2, H - size * 1.1);
+  c.restore();
+}
+
+/* ------------------------------ erasing intro (saved video) ------------------------------
+ * The first seconds of a saved video: the original photo, a scanning beam,
+ * the face mesh twinkling in and particles rising while each brow fades away.
+ * Fully deterministic (same video every time).
+ * ----------------------------------------------------------------------------------------- */
+const INTRO = 4.2;
+let introCache = null;
+function introParticles() {
+  if (introCache && introCache.key === state.browInfo) return introCache.list;
+  const list = [];
+  const b = state.browInfo, face = state.face;
+  if (b) {
+    const pts = [];
+    for (let k = 0; k < b.mask.length; k += 3) if (b.mask[k]) pts.push([(k % b.bw) + b.bx0, ((k / b.bw) | 0) + b.by0]);
+    const rnd = mulberry32(77), unit = face.eyeW;
+    for (let i = 0; i < 700 && pts.length; i++) {
+      const p = pts[(rnd() * pts.length) | 0];
+      const left = p[0] < face.midX;
+      const t0 = (left ? 1.1 : 2.1) + rnd() * 1.1;
+      list.push({ x: p[0], y: p[1], t0, life: 0.6 + rnd() * 0.9, vx: (rnd() - 0.5) * unit * 0.25, vy: -unit * (0.25 + rnd() * 0.45), r: unit * (0.008 + rnd() * 0.016) });
+    }
+  }
+  introCache = { key: state.browInfo, list };
+  return list;
+}
+function renderIntro(c, t) {
+  const { W, H, face } = state;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, W, H);
+  c.drawImage(state.orig, 0, 0);
+  // each brow fades to the erased skin, one after the other
+  const sides = [[1.2, 2.3, 0, face.midX], [2.2, 3.3, face.midX, W]];
+  for (const [a0, a1, x0, x1] of sides) {
+    const a = smooth((t - a0) / (a1 - a0));
+    if (a <= 0) continue;
+    c.save();
+    c.beginPath(); c.rect(x0, 0, x1 - x0, H); c.clip();
+    c.globalAlpha = a; c.drawImage(state.clean, 0, 0);
+    c.restore();
+  }
+  const unit = face.eyeW;
+  const fade = 1 - smooth((t - (INTRO - 0.6)) / 0.6);   // effects fade out at the end
+  c.fillStyle = `rgba(18,14,13,${(0.16 * fade).toFixed(3)})`;
+  c.fillRect(0, 0, W, H);
+  // scanning beam
+  const y0 = Math.max(0, face.P[10].y - unit * 0.4), y1 = Math.min(H, face.P[152].y + unit * 0.2);
+  const by = y0 + (y1 - y0) * (0.5 - 0.5 * Math.cos(t * Math.PI * 2 / 3.2));
+  const bh = unit * 0.5;
+  c.save();
+  c.globalCompositeOperation = 'lighter';
+  c.globalAlpha = fade;
+  const g = c.createLinearGradient(0, by - bh, 0, by + bh);
+  g.addColorStop(0, 'rgba(255,230,0,0)'); g.addColorStop(0.5, 'rgba(255,230,0,0.13)'); g.addColorStop(1, 'rgba(255,230,0,0)');
+  c.fillStyle = g; c.fillRect(0, by - bh, W, bh * 2);
+  c.fillStyle = 'rgba(255,240,150,0.35)'; c.fillRect(0, by - 0.75, W, 1.5);
+  // face mesh
+  const fin = smooth((t - 0.3) / 0.9) * fade, r = Math.max(0.8, unit * 0.011);
+  for (let i = 0; i < 468; i += 3) {
+    const p = face.P[i];
+    const near = 1 - smooth(Math.abs(p.y - by) / (unit * 1.2));
+    c.fillStyle = `rgba(255,248,210,${(fin * (0.18 + 0.22 * (0.5 + 0.5 * Math.sin(t * 2.6 + i * 1.7)) + 0.5 * near)).toFixed(3)})`;
+    c.beginPath(); c.arc(p.x, p.y, r, 0, Math.PI * 2); c.fill();
+  }
+  // particles rising from the brows
+  for (const q of introParticles()) {
+    const k = (t - q.t0) / q.life;
+    if (k <= 0 || k >= 1) continue;
+    const a = Math.sin(k * Math.PI) * 0.85;
+    const age = t - q.t0;
+    c.fillStyle = k < 0.5 ? `rgba(255,230,0,${a.toFixed(3)})` : `rgba(255,${Math.round(230 - (k - 0.5) * 360)},${Math.round((k - 0.5) * 428)},${a.toFixed(3)})`;
+    c.beginPath(); c.arc(q.x + q.vx * age, q.y + q.vy * age, q.r * (1 - k * 0.5), 0, Math.PI * 2); c.fill();
+  }
+  c.restore();
+  burnCaption(c, t < 1.0 ? 'Analysing the face' : 'Erasing the brows');
 }
 
 /* ------------------------------ playback ------------------------------ */
@@ -1568,6 +1660,7 @@ async function loadFile(file) {
   const W = Math.round(bmp.width * scale), H = Math.round(bmp.height * scale);
   state.W = W; state.H = H;
   els.stage.width = W; els.stage.height = H;
+  requestAnimationFrame(placeStageTools);
   const orig = makeCanvas(W, H);
   orig.getContext('2d', { willReadFrequently: true }).drawImage(bmp, 0, 0, W, H);
   state.orig = orig;
@@ -1670,6 +1763,22 @@ async function loadFile(file) {
 }
 
 
+/* the Replay / original buttons sit on the photo's top-right corner, wherever it is drawn */
+function placeStageTools() {
+  const tools = document.querySelector('.stage-tools'), wrap = document.querySelector('.stage-wrap');
+  if (!tools || !wrap) return;
+  const b = els.stage.getBoundingClientRect(), w = wrap.getBoundingClientRect();
+  // the picture is letterboxed inside the canvas box (object-fit: contain)
+  const iw = els.stage.width || 1, ih = els.stage.height || 1;
+  const k = Math.min(b.width / iw, b.height / ih), pw = iw * k, ph = ih * k;
+  const s = { top: b.top + (b.height - ph) / 2, right: b.right - (b.width - pw) / 2, width: pw };
+  tools.style.top = (s.top - w.top + 10) + 'px';
+  tools.style.right = (w.right - s.right + 10) + 'px';
+  tools.style.maxWidth = Math.max(120, s.width - 20) + 'px';
+}
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(placeStageTools).observe(els.stage);
+addEventListener('resize', placeStageTools);
+
 /* ------------------------------ AI notice + diagnostics ------------------------------ */
 function showAiNotice(text) {
   let el = document.getElementById('aiNotice');
@@ -1736,22 +1845,44 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
+// Records the whole story (erasing intro + mapping animation) on an off-screen
+// canvas: the picture on screen does not replay, the button shows progress.
+let recording = false;
 function saveVideo() {
+  if (recording) return;
   const types = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
-  const type = types.find((t) => MediaRecorder.isTypeSupported(t));
+  const type = typeof MediaRecorder !== 'undefined' && types.find((t) => MediaRecorder.isTypeSupported(t));
   if (!type) { setStatus('Video recording is not supported in this browser.', true); return; }
-  const stream = els.stage.captureStream(30);
+  const { W, H } = state;
+  const rc = document.createElement('canvas');
+  rc.width = W; rc.height = H;
+  const rctx = rc.getContext('2d');
+  renderIntro(rctx, 0);
+  const stream = rc.captureStream(30);
   const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 6_000_000 });
   const chunks = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const label = els.saveVid.textContent;
+  const total = INTRO + state.timeline.end + 1.2;
+  recording = true;
+  els.saveVid.disabled = true;
   rec.onstop = () => {
-    setStatus('');
+    recording = false;
     els.saveVid.disabled = false;
+    els.saveVid.textContent = label;
     download(new Blob(chunks, { type }), `brow-mapping.${type.includes('mp4') ? 'mp4' : 'webm'}`);
   };
-  els.saveVid.disabled = true;
   rec.start();
-  play(() => setTimeout(() => rec.stop(), 1200));
+  const t0 = performance.now();
+  const frame = (now) => {
+    const t = (now - t0) / 1000;
+    if (t < INTRO) renderIntro(rctx, t);
+    else render(Math.min(t - INTRO, state.timeline.end), rctx, { burnCaption: true });
+    els.saveVid.textContent = `Saving… ${Math.min(99, Math.round(t / total * 100))}%`;
+    if (t < total) requestAnimationFrame(frame);
+    else rec.stop();
+  };
+  requestAnimationFrame(frame);
 }
 
 /* ------------------------------ UI wiring ------------------------------ */

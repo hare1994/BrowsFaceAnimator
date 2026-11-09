@@ -65,6 +65,25 @@ main { max-width: 1100px; margin: 0 auto; }
 .studio[hidden] { display: none; }
 
 .stage-wrap { position: relative; }
+/* the photo stays in view while the controls are scrolled */
+.studio .stage-wrap { position: sticky; top: 10px; z-index: 5; }
+
+.stage-tools {
+  position: absolute; z-index: 2;
+  display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap;
+}
+.tool {
+  appearance: none; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(28, 24, 23, 0.6);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  color: #fff; font: inherit; font-size: 13px; font-weight: 650;
+  padding: 8px 12px; border-radius: 999px; cursor: pointer;
+  user-select: none; -webkit-user-select: none; touch-action: manipulation;
+}
+.tool.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.tool:disabled { opacity: 0; pointer-events: none; }
+.tool:hover:not(:disabled) { filter: brightness(1.08); }
 
 #stage {
   display: block;
@@ -144,7 +163,9 @@ main { max-width: 1100px; margin: 0 auto; }
 
 @media (max-width: 860px) {
   .studio { grid-template-columns: 1fr; }
-  #stage { max-height: 72vh; }
+  /* phone: pinned to the top, small enough to leave the sliders reachable */
+  .studio .stage-wrap { top: 0; margin: 0 -16px; padding: 8px 16px; background: var(--bg); }
+  #stage { max-height: 46vh; width: auto; max-width: 100%; margin: 0 auto; }
 }
 
 /* ---------- working / progress overlay ---------- */
