@@ -26,6 +26,8 @@ public/            static site (this is what gets deployed)
   style.css
   app.js           face detection, AI repaint, mapping, animation
   removal.js       brow-hair detection + classic fill (no DOM; runs in removal-worker.js)
+  ai-worker.js     runs the MI-GAN model in its own thread (fast multi-threaded mode,
+                   automatic fallback to single-threaded mode)
   vendor/mediapipe MediaPipe Tasks Vision 0.10.14 (JS + WASM, self-hosted)
   vendor/ort       onnxruntime-web 1.22.0 (WASM build)
   models/          face_landmarker.task, migan.part0/part1 (MI-GAN, split to stay under 25 MB per file)

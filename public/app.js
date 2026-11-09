@@ -1,5 +1,4 @@
 import { FaceLandmarker, FilesetResolver } from './vendor/mediapipe/vision_bundle.mjs';
-import * as ort from './vendor/ort/ort.wasm.min.mjs';
 import { removeBrowsData, dilateMask, boxBlur } from './removal.js';
 
 /* ------------------------------------------------------------------ *
@@ -216,51 +215,108 @@ function removeBrows(src, face) {
  * model ships in two parts (hosting limit of 25 MB per file).
  * -------------------------------------------------------------------------- */
 let miganPromise = null;
-const miganLoad = { loaded: 0, total: 0, ready: false };
+const miganLoad = { loaded: 0, total: 0, ready: false, mode: '', error: '' };
+const MIGAN_BYTES = 28079181;
+
+// Starts the model in a worker. First choice: multi-threaded (fast). If that
+// fails or hangs, a fresh worker in single-threaded mode is tried; a failure of
+// the fast mode is remembered so the next visit starts in the safe mode.
 function getMigan() {
   if (!miganPromise) {
     miganPromise = (async () => {
-      ort.env.wasm.wasmPaths = new URL('./vendor/ort/', import.meta.url).href;
-      ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-      ort.env.wasm.proxy = true; // run in a worker so the page (and its animation) stays smooth
-      const parts = await Promise.all(['migan.part0', 'migan.part1'].map(async (f) => {
-        const r = await fetch(new URL('./models/' + f, import.meta.url));
-        if (!r.ok) throw new Error('model download failed');
-        const size = +r.headers.get('content-length') || 14e6;
-        miganLoad.total += size;
-        if (!r.body || !r.body.getReader) { const b = new Uint8Array(await r.arrayBuffer()); miganLoad.loaded += b.length; return b; }
-        const reader = r.body.getReader(), chunks = [];
-        let got = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value); got += value.length; miganLoad.loaded += value.length;
+      let safe = false;
+      try { safe = localStorage.getItem('brow-ai-safe') === '1'; } catch {}
+      const canThread = self.crossOriginIsolated && (navigator.hardwareConcurrency || 1) > 1;
+      const modes = [];
+      if (canThread && !safe) modes.push(Math.min(4, navigator.hardwareConcurrency || 1));
+      modes.push(1);
+      const errors = [];
+      for (const threads of modes) {
+        try {
+          const w = await startAiWorker(threads);
+          miganLoad.ready = true; miganLoad.mode = threads > 1 ? `${threads} threads` : 'single thread';
+          return w;
+        } catch (e) {
+          errors.push(`${threads > 1 ? 'fast' : 'safe'} mode: ${e.message || e}`);
+          console.warn('AI start failed', threads, e);
+          if (threads > 1) { try { localStorage.setItem('brow-ai-safe', '1'); } catch {} }
+          miganLoad.loaded = 0; miganLoad.total = 0;
         }
-        const b = new Uint8Array(got);
-        let o = 0; for (const c of chunks) { b.set(c, o); o += c.length; }
-        return b;
-      }));
-      const buf = new Uint8Array(parts[0].length + parts[1].length);
-      buf.set(parts[0], 0); buf.set(parts[1], parts[0].length);
-      const sess = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
-      miganLoad.ready = true;
-      return sess;
+      }
+      throw new Error(errors.join(' | '));
     })();
-    miganPromise.catch(() => { miganPromise = null; miganLoad.loaded = miganLoad.total = 0; });
+    miganPromise.catch((e) => { miganPromise = null; miganLoad.error = String(e.message || e); });
   }
   return miganPromise;
 }
 
-// Repaints the brow mask with MI-GAN, one brow at a time.
+function startAiWorker(threads) {
+  return new Promise((resolve, reject) => {
+    let w;
+    if (threads > 1 && /[?&]aitest=failfast/.test(location.search)) { reject(new Error('forced failure (test)')); return; }
+    try { w = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' }); }
+    catch (e) { reject(new Error('this browser cannot start the AI worker')); return; }
+    const pending = new Map();
+    let seq = 0, ready = false, lastSign = performance.now();
+    const fail = (msg) => {
+      clearInterval(watch);
+      try { w.terminate(); } catch {}
+      for (const p of pending.values()) p.reject(new Error(msg));
+      pending.clear();
+      if (!ready) reject(new Error(msg));
+    };
+    // a worker that dies (e.g. out of memory) sends nothing: watch for silence
+    const watch = setInterval(() => {
+      const quiet = performance.now() - lastSign;
+      if (!ready && quiet > 45000) fail('AI did not start (no response)');
+      else if (ready && pending.size && quiet > 60000) fail('AI stopped responding');
+    }, 2000);
+    w.onerror = (e) => fail('AI worker crashed' + (e && e.message ? ': ' + e.message : ''));
+    w.onmessage = (e) => {
+      const m = e.data;
+      lastSign = performance.now();
+      if (m.type === 'progress') { miganLoad.loaded = m.loaded; miganLoad.total = m.total; return; }
+      if (m.type === 'ready') {
+        ready = true;
+        resolve({
+          threads,
+          run(chw, known, cw, ch) {
+            return new Promise((res, rej) => {
+              const id = ++seq;
+              pending.set(id, { resolve: res, reject: rej });
+              lastSign = performance.now();
+              w.postMessage({ type: 'run', id, chw, known, cw, ch }, [chw.buffer, known.buffer]);
+            });
+          },
+        });
+        return;
+      }
+      if (m.type === 'result' || m.type === 'error') {
+        if (!ready && m.type === 'error') { fail(m.error); return; }
+        const p = pending.get(m.id);
+        if (!p) return;
+        pending.delete(m.id);
+        if (m.type === 'result') p.resolve(m.r); else p.reject(new Error(m.error));
+      }
+    };
+    w.postMessage({
+      type: 'init', id: 0, threads, expected: MIGAN_BYTES,
+      wasmPaths: new URL('./vendor/ort/', import.meta.url).href,
+      urls: ['migan.part0', 'migan.part1'].map((f) => new URL('./models/' + f, import.meta.url).href),
+    });
+  });
+}
+
 class AbortError extends Error { constructor() { super('cancelled'); this.name = 'AbortError'; } }
 // the model must never run twice at the same time: queue every call
 let modelQueue = Promise.resolve();
-function runModel(session, feeds) {
-  const job = modelQueue.then(() => session.run(feeds));
+function runModel(model, chw, known, cw, ch) {
+  const job = modelQueue.then(() => model.run(chw, known, cw, ch));
   modelQueue = job.catch(() => {});
   return job;
 }
 
+// Repaints the brow mask with MI-GAN, one brow at a time.
 async function aiRemoveBrows(src, brow, face, onStep = () => {}, alive = () => true) {
   const { W, H } = state;
   const { mask, bx0, by0, bw, bh } = brow;
@@ -293,16 +349,11 @@ async function aiRemoveBrows(src, brow, face, onStep = () => {}, alive = () => t
     }
     await yieldFrame();
     if (!alive()) throw new AbortError();
-    const feeds = () => ({
-      image: new ort.Tensor('uint8', chw, [1, 3, ch, cw]),
-      mask: new ort.Tensor('uint8', known, [1, 1, ch, cw]),
-    });
-    let out;
-    try { out = await runModel(session, feeds()); }
-    catch (e) { console.warn('AI step failed, retrying once', e); out = await runModel(session, feeds()); }
+    let r;
+    try { r = await runModel(session, chw.slice(), known.slice(), cw, ch); }
+    catch (e) { console.warn('AI step failed, retrying once', e); r = await runModel(session, chw.slice(), known.slice(), cw, ch); }
     if (!alive()) throw new AbortError();
     await yieldFrame();
-    const r = out.result.data;
     // composite with a 1 px soft edge
     for (let Y = 1; Y < ch - 1; Y++) for (let X = 1; X < cw - 1; X++) {
       const j = Y * cw + X;
@@ -391,10 +442,12 @@ function mapBrows(face, s) {
   //    nose (never wider than the inner eye corner)
   const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.8 * s.gap;
   // 3) tail (standard mapping): the straight line from the outer edge of the
-  //    nostril through the outer corner of the eye, at tail height
+  //    nostril through (just past) the outer corner of the eye, at tail height
   //    (tail sits a little above the head, never lower)
   const tailY = innerBotY - 0.06 * eyeW;
-  const slope = (face.outerHalf - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
+  // the line clears the eye corner by ~0.1 eye-widths: halfway between the
+  // strict corner line (too short) and the reel's line (too long)
+  const slope = (face.outerHalf + 0.105 * eyeW - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
   const tailHalfIdeal = ax + slope * (ay - tailY);
   const tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
   // 2) arch (standard mapping): straight above the outer edge of the iris,
@@ -646,7 +699,7 @@ function buildTimeline(face, geo) {
       [2.8, 'Start: inner nose line, straight up'],
       [4.1, 'Brow height'],
       [6.1, 'Arch: above the outer edge of the iris'],
-      [7.2, 'Tail: nostril through the outer eye corner'],
+      [7.2, 'Tail: nostril past the outer eye corner'],
       [9.4, 'Mapping points'],
       [10.3, 'Connecting the shape'],
       [12.6, 'Filling in'],
@@ -1257,7 +1310,7 @@ async function loadFile(file) {
     if (window.__brow) window.__brow.maxGap = Math.round(busy.maxGap);
     await busyFinish(alive);
     if (!alive()) return;
-    if (aiFailed) { setStatus('AI erase was unavailable, so a basic erase was used. Try again for the full result.'); setTimeout(() => { if (alive()) setStatus(''); }, 4000); }
+    if (aiFailed) { setStatus('AI erase failed, a basic erase was used. Reason: ' + (window.__brow && window.__brow.aiError || 'unknown')); setTimeout(() => { if (alive()) setStatus(''); }, 9000); }
     if (hair) els.color.value = hair;
     syncOutputs();
     state.brows = mapBrows(state.face, settings());
