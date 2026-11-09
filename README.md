@@ -12,7 +12,7 @@ Upload a front-facing photo of a head. The app:
    - white diagonals from nostril through the outer eye corner (**tail**)
    - cyan tail markers
    - pink points, then the connected outline
-4. **Draws the new brows**: by default a real brow photo (brows/natural-1.*) is recoloured to her hair colour and warped with a triangle mesh onto the mapped shape (photo-real); drawn hair strokes and powder are also available.
+4. **Draws the new brows** procedurally: every hair is generated from the structure of a brow (upright fan at the head, herringbone body, hairs converging into the tail, length tied to local brow height, curved and tapered strands in several tone layers), coloured to match the erased brows. Older hair-stroke and powder styles are also available.
 
 You can then adjust thickness, arch height and position, tail length, colour and style. You can also save a PNG or a video of the whole animation.
 
@@ -30,7 +30,6 @@ public/            static site (this is what gets deployed)
                    automatic fallback to single-threaded mode)
   vendor/mediapipe MediaPipe Tasks Vision 0.10.14 (JS + WASM, self-hosted)
   vendor/ort       onnxruntime-web 1.22.0 (WASM build)
-  brows/           natural-1.webp + .json: transparent brow template and its outline
   models/          face_landmarker.task, migan.part0/part1 (MI-GAN, split to stay under 25 MB per file)
 wrangler.jsonc     Cloudflare Workers static-assets config
 ```
