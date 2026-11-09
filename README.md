@@ -24,7 +24,8 @@ Everything runs on the user's device. Photos are never uploaded.
 public/            static site (this is what gets deployed)
   index.html
   style.css
-  app.js           detection, brow removal, mapping, animation
+  app.js           face detection, AI repaint, mapping, animation
+  removal.js       brow-hair detection + classic fill (no DOM; runs in removal-worker.js)
   vendor/mediapipe MediaPipe Tasks Vision 0.10.14 (JS + WASM, self-hosted)
   vendor/ort       onnxruntime-web 1.22.0 (WASM build)
   models/          face_landmarker.task, migan.part0/part1 (MI-GAN, split to stay under 25 MB per file)
