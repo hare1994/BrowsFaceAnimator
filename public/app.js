@@ -702,6 +702,86 @@ function makeStrokes(face, geo, s) {
   return strokes;
 }
 
+
+/* ------------------------------ colour matching ------------------------------
+ * Makes the new brows the same colour as the brows that were erased: measure
+ * the original brow hair (darker half of the brow pixels), render the new
+ * brows off-screen, measure them the same way, adjust the tint, repeat.
+ * --------------------------------------------------------------------------- */
+function darkerHalfMean(pixels) { // pixels: array of [r,g,b,lum]; mean of the darkest quarter
+  if (pixels.length < 20) return null;
+  pixels.sort((a, b) => a[3] - b[3]);
+  const n = Math.max(10, Math.floor(pixels.length * 0.25)); // the hair itself, not the skin between
+  let r = 0, g = 0, b = 0;
+  for (let i = 0; i < n; i++) { r += pixels[i][0]; g += pixels[i][1]; b += pixels[i][2]; }
+  return [r / n, g / n, b / n];
+}
+function originalBrowColour() {
+  const info = state.browInfo;
+  if (!info) return null;
+  const { mask, bx0, by0, bw, bh } = info;
+  const d = state.orig.getContext('2d', { willReadFrequently: true }).getImageData(bx0, by0, bw, bh).data;
+  const px = [];
+  for (let k = 0; k < bw * bh; k++) if (mask[k]) px.push([d[k * 4], d[k * 4 + 1], d[k * 4 + 2], lum(d[k * 4], d[k * 4 + 1], d[k * 4 + 2])]);
+  return darkerHalfMean(px);
+}
+function renderedBrowColour(hex) {
+  const { W, H } = state;
+  const layer = makeCanvas(W, H), g = layer.getContext('2d', { willReadFrequently: true });
+  g.save(); faceTransform(g); g.imageSmoothingQuality = 'high';
+  drawNaturalBrows(g, state.brows, state.face, hex, 1);
+  g.restore();
+  // only the area the brows cover
+  let x0 = W, y0 = H, x1 = 0, y1 = 0;
+  for (const side of state.brows.sides) for (const p0 of side.outline) {
+    const q = faceToImage(p0);
+    x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); y0 = Math.min(y0, q.y); y1 = Math.max(y1, q.y);
+  }
+  const pad = state.face.eyeW * 0.2;
+  x0 = Math.max(0, Math.floor(x0 - pad)); y0 = Math.max(0, Math.floor(y0 - pad));
+  x1 = Math.min(W, Math.ceil(x1 + pad)); y1 = Math.min(H, Math.ceil(y1 + pad));
+  const w = x1 - x0, h = y1 - y0;
+  if (w <= 0 || h <= 0) return null;
+  const la = g.getImageData(x0, y0, w, h).data;
+  const comp = makeCanvas(w, h), cg = comp.getContext('2d', { willReadFrequently: true });
+  cg.drawImage(state.clean, x0, y0, w, h, 0, 0, w, h);
+  cg.drawImage(layer, x0, y0, w, h, 0, 0, w, h);
+  const cd = cg.getImageData(0, 0, w, h).data;
+  const px = [];
+  for (let k = 0; k < w * h; k++) if (la[k * 4 + 3] > 64) px.push([cd[k * 4], cd[k * 4 + 1], cd[k * 4 + 2], lum(cd[k * 4], cd[k * 4 + 1], cd[k * 4 + 2])]);
+  return darkerHalfMean(px);
+}
+function faceToImage(q) { // inverse of face.F
+  const { C, angle } = state.face;
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return pt(C.x + (q.x - C.x) * c - (q.y - C.y) * s, C.y + (q.x - C.x) * s + (q.y - C.y) * c);
+}
+function matchBrowColour() {
+  if (!browTpl.meta) return null;
+  const target = originalBrowColour();
+  if (!target) return null;
+  let col = hexToRgb(els.color.value);
+  let got = null;
+  for (let it = 0; it < 4; it++) {
+    got = renderedBrowColour(rgbToHex(col));
+    if (!got) return null;
+    const err = Math.abs(got[0] - target[0]) + Math.abs(got[1] - target[1]) + Math.abs(got[2] - target[2]);
+    if (err < 4) break;
+    col = {
+      r: clamp(col.r * clamp(target[0] / Math.max(1, got[0]), 0.5, 2), 0, 255),
+      g: clamp(col.g * clamp(target[1] / Math.max(1, got[1]), 0.5, 2), 0, 255),
+      b: clamp(col.b * clamp(target[2] / Math.max(1, got[2]), 0.5, 2), 0, 255),
+    };
+  }
+  const hex = rgbToHex(col);
+  els.color.value = hex;
+  // drop tints made during matching
+  for (const k of [...browTpl.tinted.keys()]) if (k !== hex) browTpl.tinted.delete(k);
+  const res = { target: target.map(Math.round), rendered: renderedBrowColour(hex).map(Math.round), hex };
+  if (window.__brow) window.__brow.colour = res;
+  return res;
+}
+
 /* ------------------------------ timeline ------------------------------ */
 
 function buildTimeline(face, geo) {
@@ -1547,6 +1627,8 @@ async function loadFile(file) {
     try { await loadBrowTemplate(); } catch { if (els.style.value === 'natural') els.style.value = 'strokes'; }
     if (!alive()) return;
     state.brows = mapBrows(state.face, settings());
+    // new brows in exactly the colour of the brows that were erased
+    try { matchBrowColour(); } catch (e) { console.warn('colour match skipped', e); }
     state.timeline = buildTimeline(state.face, state.brows);
     play();
   } catch (err) {
