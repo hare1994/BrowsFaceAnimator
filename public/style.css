@@ -147,6 +147,7 @@ main { max-width: 1100px; margin: 0 auto; }
 .controls label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 14px; }
 .controls output { color: var(--text); float: right; }
 .controls input[type=range] { width: 100%; accent-color: var(--accent); }
+.controls label > select { width: 100%; }
 .controls select {
   background: rgba(0, 0, 0, 0.2); color: var(--text);
   border: 1px solid var(--line); border-radius: 8px; padding: 7px; font: inherit;

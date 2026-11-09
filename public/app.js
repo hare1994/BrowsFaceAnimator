@@ -26,7 +26,7 @@ const LM = {
   browPolyL: [300, 293, 334, 296, 336, 285, 295, 282, 283, 276],
 };
 
-const COLORS = { yellow: '#ffe600', white: '#ffffff', cyan: '#31e6ff', pink: '#ff2bd6' };
+const COLORS = { yellow: '#ffe600', white: '#ffffff', cyan: '#31e6ff', pink: '#ff2bd6', cross: '#ff9ad8' };
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -36,7 +36,7 @@ const els = {
   thick: $('thick'), lift: $('lift'), arch: $('arch'), tail: $('tail'), gap: $('gap'),
   color: $('color'), style: $('style'),
   measure: $('measure'), measureList: $('measureList'),
-  format: $('format'), savePng: $('savePng'), saveVid: $('saveVid'), newPhoto: $('newPhoto'),
+  faceShape: $('faceShape'), format: $('format'), savePng: $('savePng'), saveVid: $('saveVid'), newPhoto: $('newPhoto'),
 };
 const ctx = els.stage.getContext('2d');
 
@@ -430,7 +430,16 @@ function ownBrowBottom(face) {
   if ('ownBrowBottom' in memo) return memo['ownBrowBottom'];
   return (memo['ownBrowBottom'] = ownBrowBottomCalc(face, b));
 }
-function ownBrowBottomCalc(face, b) {
+function ownBrowBottomSide(face, sg) {
+  const b = state.browInfo;
+  if (!b) return null;
+  const memo = (b._memo = b._memo || {});
+  const k = 'bot' + sg;
+  if (k in memo) return memo[k];
+  return (memo[k] = ownBrowBottomCalc(face, b, sg));
+}
+function ownBrowBottomCalc(face, b, sg = 0) {
+
   const { mask, bx0, by0, bw, bh } = b;
   const { midX, eyeW } = face;
   const h0 = Math.min(face.noseHalf, face.innerCornerHalf) * 0.8;
@@ -441,9 +450,10 @@ function ownBrowBottomCalc(face, b) {
     if (bot < 0) continue;
     const q = face.F(pt(x + bx0, bot + by0));
     const half = Math.abs(q.x - midX);
+    if (sg && Math.sign(q.x - midX) !== sg) continue; // one side only
     if (half >= h0 && half <= h0 + eyeW * 0.4) vals.push(q.y);
   }
-  if (vals.length < 6) return null;
+  if (vals.length < (sg ? 3 : 6)) return null;
   vals.sort((a, b) => a - b);
   // the mask reaches a little past the hairs; step back to the hair edge
   return vals[vals.length >> 1] - eyeW * 0.03;
@@ -473,70 +483,100 @@ function ownBrowOuterHalfCalc(face, b) {
   return (maxL + maxR) / 2 - face.eyeW * 0.03;
 }
 
+// ---- face shape (from landmark proportions; the mesh top is the upper forehead, not the hairline) ----
+const SHAPE_NAMES = { oval: 'Oval', round: 'Round', square: 'Square', heart: 'Heart', long: 'Long' };
+const FACE_SHAPES = {
+  oval:   { lift: 1.0,  archPos: 1.0,  tail: 1.0,  round: 0.5 },  // soft medium arch
+  round:  { lift: 1.3,  archPos: 1.03, tail: 1.04, round: 0.18 }, // higher, more angled arch, longer tail
+  square: { lift: 1.05, archPos: 0.94, tail: 1.0,  round: 0.85 }, // soft curve, peak a little forward
+  heart:  { lift: 0.78, archPos: 1.0,  tail: 1.0,  round: 0.85 }, // low, rounded arch
+  long:   { lift: 0.6,  archPos: 1.03, tail: 1.03, round: 0.6 },  // flatter, more horizontal
+};
+function detectFaceShape(face) {
+  const Q = (i) => face.F(face.P[i]);
+  const w = (a, b) => Math.abs(Q(a).x - Q(b).x);
+  const cheek = w(234, 454);
+  const len = (Q(152).y - Q(10).y) / cheek, fore = w(54, 284) / cheek, jaw = w(172, 397) / cheek;
+  let shape = 'oval';
+  if (len >= 1.36) shape = 'long';
+  else if (fore - jaw >= 0.13) shape = 'heart';
+  else if (jaw >= 0.84) shape = 'square';
+  else if (len <= 1.15) shape = 'round';
+  return { shape, len, fore, jaw };
+}
+function faceShapeOf(face) {
+  const pick = els.faceShape ? els.faceShape.value : 'auto';
+  if (pick !== 'auto') return { shape: pick, auto: false };
+  if (!face._shape) face._shape = detectFaceShape(face);
+  return { ...face._shape, auto: true };
+}
+
+// per-side face measurements (half-distances from the centre line), so each
+// brow is mapped from its own eye and nostril
+function sideFeatures(face, sg) {
+  const Q = (i) => face.F(face.P[i]);
+  const half = (q) => Math.abs(q.x - face.midX);
+  const R = sg < 0;
+  const nose = Q(R ? LM.alarR : LM.alarL), iris = Q(R ? LM.irisR : LM.irisL);
+  const inner = Q(R ? LM.eyeInR : LM.eyeInL), outer = Q(R ? LM.eyeOutR : LM.eyeOutL);
+  return {
+    noseHalf: half(nose), nostrilY: nose.y,
+    irisHalf: half(iris), eyeY: iris.y,
+    innerCornerHalf: half(inner), outerHalf: half(outer), outerY: outer.y,
+  };
+}
+
 function mapBrows(face, s) {
   const { midX, eyeY, eyeW } = face;
+  const fs = faceShapeOf(face), shape = FACE_SHAPES[fs.shape] || FACE_SHAPES.oval;
 
-  // Proportions (eye-widths from the pupil line) follow a full, natural,
-  // softly angled brow: low full head, steady rise to an arch above the
-  // outer eye corner, tail finishing a little above the head.
-  //   head 0.40–0.67 · arch 0.62–0.89 · tail 0.46
-
-  // Brow base: mostly where her own brow bone / brow sits.
-  // The real brow (found while erasing) is the most reliable guide: the new
-  // brow head sits where her own brow head was, even for brows set very
-  // close to the eyes. Landmarks are only a fallback.
+  // brow base height: where her own brow sits (found while erasing), per side;
+  // the two sides "split the difference" (sisters, not twins): each moves
+  // halfway towards their common height
   const idealBot = eyeY - 0.45 * eyeW;
-  const measured = ownBrowBottom(face);
-  const ownBot = measured != null ? measured : face.browInBotY + 0.06 * eyeW;
-  const innerBotY = measured != null ? lerp(idealBot, ownBot, 0.9)
-    : Math.abs(ownBot - idealBot) < 0.3 * eyeW ? lerp(idealBot, ownBot, 0.85) : idealBot;
+  const own = [-1, 1].map((sg) => ownBrowBottomSide(face, sg));
+  const measured = own[0] != null && own[1] != null;
+  const ownMean = measured ? (own[0] + own[1]) / 2 : face.browInBotY + 0.06 * eyeW;
+  const baseFor = (i) => {
+    if (!measured) return Math.abs(ownMean - idealBot) < 0.3 * eyeW ? lerp(idealBot, ownMean, 0.85) : idealBot;
+    const sideOwn = lerp(own[i], ownMean, 0.5);
+    return lerp(idealBot, sideOwn, 0.9);
+  };
 
   const thickness = 0.27 * eyeW * s.thick;
-  const innerTopY = innerBotY - thickness;
-  const archTopY = innerTopY - 0.22 * eyeW * s.lift;
+  const lift = 0.22 * eyeW * s.lift * shape.lift;
   const archThick = thickness * 0.85;
 
-  const ax = face.noseHalf, ay = face.nostrilY;
+  const sides = [-1, 1].map((sg, i) => {
+    const f = sideFeatures(face, sg);
+    const innerBotY = baseFor(i);
+    const innerTopY = innerBotY - thickness;
+    const archTopY = innerTopY - lift;
+    const ax = f.noseHalf, ay = f.nostrilY;
 
-  // 1) start: up from the nostril edge, pulled in towards the bridge of the
-  //    nose (never wider than the inner eye corner)
-  const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.8 * s.gap;
-  // 3) tail (standard mapping): the straight line from the outer edge of the
-  //    nostril through (just past) the outer corner of the eye, at tail height
-  //    (tail sits a little above the head, never lower)
-  // the tail tip ends level with the bottom of the brow head (never lower);
-  // its length is measured on the tail line slightly higher, which keeps the
-  // length you approved
-  const tailLenY = innerBotY - 0.06 * eyeW;
-  const tailY = innerBotY;
-  // the line clears the eye corner by ~0.1 eye-widths: halfway between the
-  // strict corner line (too short) and the reel's line (too long)
-  const slope = (face.outerHalf + 0.105 * eyeW - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
-  const tailHalfIdeal = ax + slope * (ay - tailLenY);
-  let tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
-  // Brows set very low (close to the eye) and naturally long: draw them a
-  // touch longer (up to +5%, never past where her own brow ended). All other
-  // faces are untouched (weight 0 when the brow sits 0.21+ eye-widths up).
-  {
-    const low = (eyeY - ownBot) / eyeW;
-    const wLow = measured != null ? smooth((0.21 - low) / 0.05) : 0;
-    const reach = ownBrowOuterHalf(face);
-    if (wLow > 0 && reach != null && reach > tailHalf) {
-      tailHalf = Math.min(reach, tailHalf + (tailHalf - innerHalf) * 0.05 * wLow);
+    // 1) start: straight up from the nostril edge, pulled in towards the bridge
+    //    (never wider than the inner eye corner)
+    const innerHalf = Math.min(ax, f.innerCornerHalf) * 0.8 * s.gap;
+    // 3) tail: line from the nostril edge just past the outer eye corner; the
+    //    tip ends level with the bottom of the brow head
+    const tailLenY = innerBotY - 0.06 * eyeW;
+    const tailY = innerBotY;
+    const slope = (f.outerHalf + 0.105 * eyeW - ax) / Math.max(1, ay - f.outerY);
+    const tailHalfIdeal = ax + slope * (ay - tailLenY);
+    let tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail * shape.tail;
+    // low, naturally long brows: a touch longer (never past her own brow)
+    {
+      const low = (f.eyeY - (measured ? own[i] : ownMean)) / eyeW;
+      const wLow = measured ? smooth((0.21 - low) / 0.05) : 0;
+      const reach = ownBrowOuterHalf(face);
+      if (wLow > 0 && reach != null && reach > tailHalf) tailHalf = Math.min(reach, tailHalf + (tailHalf - innerHalf) * 0.05 * wLow);
     }
-  }
-  if (window.__brow) window.__brow.metrics = {
-    low: +((eyeY - ownBot) / eyeW).toFixed(3),
-    tailHalf: +tailHalf.toFixed(2), tailHalfIdeal: +(innerHalf + (tailHalfIdeal - innerHalf) * s.tail).toFixed(2),
-  };
-  // 2) arch (standard mapping, as in the reference reel): the line from the
-  //    nostril edge through the centre of the pupil, where it reaches the
-  //    arch height (about two-thirds along the brow)
-  const archSlope = (face.irisHalf - ax) / Math.max(1, ay - eyeY);
-  const archLine = ax + archSlope * (ay - archTopY);
-  const archHalf = clamp(innerHalf + (archLine - innerHalf) * s.arch, innerHalf + (tailHalf - innerHalf) * 0.5, innerHalf + (tailHalf - innerHalf) * 0.8);
+    // 2) arch: line from the nostril edge through the centre of the pupil, at
+    //    the arch height (face shape can move the peak slightly)
+    const archSlope = (f.irisHalf - ax) / Math.max(1, ay - f.eyeY);
+    const archLine = ax + archSlope * (ay - archTopY);
+    const archHalf = clamp(innerHalf + (archLine - innerHalf) * s.arch * shape.archPos, innerHalf + (tailHalf - innerHalf) * 0.5, innerHalf + (tailHalf - innerHalf) * 0.8);
 
-  const sides = [-1, 1].map((sg) => {
     const X = (h) => midX + sg * h;
     const IT = pt(X(innerHalf), innerTopY);
     const IB = pt(X(innerHalf), innerBotY);
@@ -544,37 +584,43 @@ function mapBrows(face, s) {
     const AB = pt(X(archHalf), archTopY + archThick);
     const T = pt(X(tailHalf), tailY);
     const span1 = archHalf - innerHalf, span2 = tailHalf - archHalf;
+    // how rounded the arch is (face shape): small = angled peak, large = soft curve
+    const r1 = lerp(0.06, 0.34, shape.round), r2 = lerp(0.1, 0.42, shape.round);
 
-    // top edge: soft rounded front, then an almost straight rise to the arch
     const frontTop = pt(X(innerHalf + span1 * 0.12), innerTopY - (innerTopY - archTopY) * 0.22);
     const top = [];
     cubic(IT, pt(X(innerHalf + span1 * 0.02), IT.y - thickness * 0.08), pt(X(innerHalf + span1 * 0.07), frontTop.y + thickness * 0.02), frontTop, 8, top);
-    cubic(frontTop, pt(X(innerHalf + span1 * 0.5), frontTop.y - (frontTop.y - AT.y) * 0.7), pt(X(archHalf - span1 * 0.18), AT.y), AT, 24, top);
-    cubic(AT, pt(X(archHalf + span2 * 0.28), AT.y), pt(X(tailHalf - span2 * 0.3), T.y - (T.y - AT.y) * 0.5), T, 20, top);
+    cubic(frontTop, pt(X(innerHalf + span1 * 0.5), frontTop.y - (frontTop.y - AT.y) * 0.7), pt(X(archHalf - span1 * r1), AT.y), AT, 24, top);
+    cubic(AT, pt(X(archHalf + span2 * r2), AT.y), pt(X(tailHalf - span2 * 0.3), T.y - (T.y - AT.y) * 0.5), T, 20, top);
     top.unshift(IT);
 
-    // bottom edge: nearly straight, lifting slightly under the arch, then to the tail
     const bottom = [T];
     cubic(T, pt(X(tailHalf - span2 * 0.4), T.y - (T.y - AB.y) * 0.3), pt(X(archHalf + span2 * 0.3), AB.y), AB, 20, bottom);
     cubic(AB, pt(X(archHalf - span1 * 0.4), AB.y), pt(X(innerHalf + span1 * 0.3), IB.y - (IB.y - AB.y) * 0.1), IB, 24, bottom);
 
-    // rounded inner end, slightly fuller at the bottom like a natural brow head
     const front = [];
     cubic(IB, pt(IB.x - sg * thickness * 0.22, IB.y - thickness * 0.1), pt(IT.x - sg * thickness * 0.2, IT.y + thickness * 0.35), IT, 10, front);
 
     const outline = [...top, ...bottom.slice(1), ...front];
     const path = new Path2D();
-    outline.forEach((p, i) => (i ? path.lineTo(p.x, p.y) : path.moveTo(p.x, p.y)));
+    outline.forEach((p, k) => (k ? path.lineTo(p.x, p.y) : path.moveTo(p.x, p.y)));
     path.closePath();
 
-    return { sg, IT, IB, AT, AB, T, outline, path, outlineLen: polylineLength(outline) };
+    return {
+      sg, IT, IB, AT, AB, T, outline, path, outlineLen: polylineLength(outline),
+      innerHalf, archHalf, tailHalf, innerTopY, innerBotY, archTopY, tailY, thickness, archThick,
+      slope, archSlope, noseHalf: ax, nostrilY: ay,
+    };
   });
 
+  // both-side averages (measurements, symmetric guide lines)
+  const avg = (k) => (sides[0][k] + sides[1][k]) / 2;
   const geo = {
-    innerHalf, archHalf, tailHalf, innerTopY, innerBotY, archTopY, tailY, thickness, archThick,
-    slope, archSlope, sides,
+    innerHalf: avg('innerHalf'), archHalf: avg('archHalf'), tailHalf: avg('tailHalf'),
+    innerTopY: avg('innerTopY'), innerBotY: avg('innerBotY'), archTopY: avg('archTopY'), tailY: avg('tailY'),
+    thickness, archThick, slope: avg('slope'), archSlope: avg('archSlope'), sides, faceShape: fs,
   };
-  // drawn hair strokes are only needed by the 'strokes' styles: build them lazily
+  if (window.__brow) window.__brow.metrics = { faceShape: fs.shape, sides: sides.map((sd) => ({ start: sd.innerHalf / eyeW, arch: sd.archHalf / eyeW, tail: sd.tailHalf / eyeW, base: (eyeY - sd.innerBotY) / eyeW })) };
   let strokes = null;
   Object.defineProperty(geo, 'strokes', { get: () => strokes || (strokes = makeStrokes(face, geo, s)) });
   return geo;
@@ -839,38 +885,51 @@ function buildTimeline(face, geo) {
 
   // centre line, grows up from the chin
   add({ color: COLORS.yellow, a: pt(midX, chinY), b: pt(midX, topY), t0: 1.9, d: 0.9, tip: true });
-  // nostril verticals -> brow start
-  for (const sg of [-1, 1]) {
-    const x = midX + sg * geo.innerHalf;
-    add({ color: COLORS.yellow, a: pt(x, chinY - eyeW * 0.1), b: pt(x, topY + eyeW * 0.2), t0: 2.8 + (sg > 0 ? 0.25 : 0), d: 0.9, tip: true });
+  const SH = 1.3; // time inserted for the crossing upper lines
+  const [sL, sR] = geo.sides;
+  // nostril verticals -> brow start (each side from its own nostril)
+  for (const sd of geo.sides) {
+    const x = midX + sd.sg * sd.innerHalf;
+    add({ color: COLORS.yellow, a: pt(x, chinY - eyeW * 0.1), b: pt(x, topY + eyeW * 0.2), t0: 2.8 + (sd.sg > 0 ? 0.25 : 0), d: 0.9, tip: true });
   }
-  // brow-top (short), brow-bottom (short), arch line (long)
+  // brow-top (short), brow-bottom (short), arch line (long): per side
   const short = face.noseHalf + eyeW * 0.55;
-  add({ color: COLORS.yellow, a: pt(midX - short, geo.innerTopY), b: pt(midX + short, geo.innerTopY), t0: 4.1, d: 0.6, fromCenter: true });
-  add({ color: COLORS.yellow, a: pt(midX - short, geo.innerBotY), b: pt(midX + short, geo.innerBotY), t0: 4.6, d: 0.6, fromCenter: true });
-  add({ color: COLORS.yellow, a: pt(midX - longHalf, geo.archTopY), b: pt(midX + longHalf, geo.archTopY), t0: 5.2, d: 0.8, fromCenter: true });
-  // white: arch lines, from the nostril edge through the centre of the pupil
-  for (const sg of [-1, 1]) {
-    const ax = midX + sg * face.noseHalf, ay = face.nostrilY;
-    const ey = geo.archTopY - eyeW * 0.12;
-    const ex = midX + sg * (face.noseHalf + geo.archSlope * (ay - ey));
-    add({ color: COLORS.white, a: pt(ax, ay), b: pt(ex, ey), t0: 6.1 + (sg > 0 ? 0.3 : 0), d: 0.8, tip: true });
+  for (const sd of geo.sides) {
+    const x0 = midX, x1 = midX + sd.sg * short, xl = midX + sd.sg * (sd.tailHalf + eyeW * 0.35);
+    add({ color: COLORS.yellow, a: pt(x0, sd.innerTopY), b: pt(x1, sd.innerTopY), t0: 4.1, d: 0.6 });
+    add({ color: COLORS.yellow, a: pt(x0, sd.innerBotY), b: pt(x1, sd.innerBotY), t0: 4.6, d: 0.6 });
+    add({ color: COLORS.yellow, a: pt(x0, sd.archTopY), b: pt(xl, sd.archTopY), t0: 5.2, d: 0.8 });
   }
-  // white: diagonals nostril -> outer eye corner -> tail
-  for (const sg of [-1, 1]) {
-    const ax = midX + sg * face.noseHalf, ay = face.nostrilY;
-    const ey = geo.archTopY - eyeW * 0.05;
-    const ex = midX + sg * (face.noseHalf + geo.slope * (ay - ey));
-    add({ color: COLORS.white, a: pt(ax, ay), b: pt(ex, ey), t0: 7.2 + (sg > 0 ? 0.35 : 0), d: 0.9, tip: true });
+  // white: arch lines, from the nostril edge through the centre of the pupil
+  for (const sd of geo.sides) {
+    const ax = midX + sd.sg * sd.noseHalf, ay = sd.nostrilY;
+    const ey = sd.archTopY - eyeW * 0.12;
+    const ex = midX + sd.sg * (sd.noseHalf + sd.archSlope * (ay - ey));
+    add({ color: COLORS.white, a: pt(ax, ay), b: pt(ex, ey), t0: 6.1 + (sd.sg > 0 ? 0.3 : 0), d: 0.8, tip: true });
+  }
+  // white: diagonals nostril -> past the outer eye corner -> tail
+  for (const sd of geo.sides) {
+    const ax = midX + sd.sg * sd.noseHalf, ay = sd.nostrilY;
+    const ey = sd.archTopY - eyeW * 0.05;
+    const ex = midX + sd.sg * (sd.noseHalf + sd.slope * (ay - ey));
+    add({ color: COLORS.white, a: pt(ax, ay), b: pt(ex, ey), t0: 7.2 + (sd.sg > 0 ? 0.35 : 0), d: 0.9, tip: true });
   }
   // cyan tail markers
-  for (const sg of [-1, 1]) {
-    const x = midX + sg * geo.tailHalf;
-    add({ color: COLORS.cyan, a: pt(x, geo.tailY + ext), b: pt(x, geo.tailY - ext * 1.4), t0: 8.6 + (sg > 0 ? 0.2 : 0), d: 0.5, tip: true });
+  for (const sd of geo.sides) {
+    const x = midX + sd.sg * sd.tailHalf;
+    add({ color: COLORS.cyan, a: pt(x, sd.tailY + ext), b: pt(x, sd.tailY - ext * 1.4), t0: 8.6 + (sd.sg > 0 ? 0.2 : 0), d: 0.5, tip: true });
+  }
+  // string method: upper line from the base of one brow, through the centre,
+  // to the peak of the other brow (and the mirror line)
+  for (const [from, to, k] of [[sL, sR, 0], [sR, sL, 1]]) {
+    const a = from.IB, b = to.AT;
+    const ext2 = 0.12;
+    const e = pt(b.x + (b.x - a.x) * ext2, b.y + (b.y - a.y) * ext2);
+    add({ color: COLORS.cross, a, b: e, t0: 9.1 + k * 0.45, d: 0.9, tip: true });
   }
 
   const dots = [];
-  let td = 9.4;
+  let td = 9.4 + SH;
   for (const side of geo.sides) {
     for (const k of ['IT', 'IB', 'AT', 'T']) { dots.push({ p: side[k], t0: td }); td += 0.09; }
   }
@@ -879,10 +938,10 @@ function buildTimeline(face, geo) {
     removeStart: -2, removeEnd: -1, // brows are already erased during the working animation
     gridStart: 1.3, gridEnd: 1.9,
     lines: L, dots,
-    outlineStart: 10.3, outlineEnd: 11.8,
-    guidesFadeStart: 12.0, guidesFadeEnd: 12.8,
-    fillStart: 12.6, fillEnd: 15.0,
-    end: 15.6,
+    outlineStart: 10.3 + SH, outlineEnd: 11.8 + SH,
+    guidesFadeStart: 12.0 + SH, guidesFadeEnd: 12.8 + SH,
+    fillStart: 12.6 + SH, fillEnd: 15.0 + SH,
+    end: 15.6 + SH,
     captions: [
       [0, ''],
       [1.8, 'Centre line'],
@@ -890,10 +949,11 @@ function buildTimeline(face, geo) {
       [4.1, 'Brow height'],
       [6.1, 'Arch: nose line through the pupil'],
       [7.2, 'Tail: nostril past the outer eye corner'],
-      [9.4, 'Mapping points'],
-      [10.3, 'Connecting the shape'],
-      [12.6, 'Filling in'],
-      [15.0, ''],
+      [9.1, 'Upper line: base of one brow to the peak of the other'],
+      [9.4 + SH, 'Mapping points'],
+      [10.3 + SH, 'Connecting the shape'],
+      [12.6 + SH, 'Filling in'],
+      [15.0 + SH, ''],
     ],
   };
 }
@@ -989,7 +1049,7 @@ function browMask() {
  * hairs follow the brow when the shape sliders move.
  * --------------------------------------------------------------------------- */
 function browEdges(side, geo, face, BINS = 64) {
-  const span = geo.tailHalf - geo.innerHalf;
+  const span = side.tailHalf - side.innerHalf;
   const topB = new Float32Array(BINS + 1).fill(1e9), botB = new Float32Array(BINS + 1).fill(-1e9);
   const ol = side.outline;
   for (let i = 0; i < ol.length; i++) {
@@ -997,7 +1057,7 @@ function browEdges(side, geo, face, BINS = 64) {
     const steps = Math.max(1, Math.ceil(dist(p0, p1)));
     for (let t = 0; t <= steps; t++) {
       const px = lerp(p0.x, p1.x, t / steps), py = lerp(p0.y, p1.y, t / steps);
-      const b = Math.round(clamp((Math.abs(px - face.midX) - geo.innerHalf) / span) * BINS);
+      const b = Math.round(clamp((Math.abs(px - face.midX) - side.innerHalf) / span) * BINS);
       topB[b] = Math.min(topB[b], py); botB[b] = Math.max(botB[b], py);
     }
   }
@@ -1052,12 +1112,12 @@ function hairSeeds() {
 // builds the hair geometry for the current brow shape: per bucket, one Path2D
 function buildHairPaths(geo, face, reveal) {
   const eyeW = face.eyeW;
-  const span = geo.tailHalf - geo.innerHalf;
   const seeds = hairSeeds();
   const CH = 8; // chunks along the brow: many small paths rasterise faster than one huge one
   const buckets = HAIR_LAYERS.map(() => Array.from({ length: TONE_STEPS }, () => Array.from({ length: CH * 2 }, () => new Path2D())));
   geo.sides.forEach((side, si) => {
     const sg = side.sg;
+    const span = side.tailHalf - side.innerHalf;
     const { topB, botB, BINS } = browEdges(side, geo, face);
     const at = (arr, u) => { const f = clamp(u) * BINS, i = Math.min(BINS - 1, Math.floor(f)), t = f - i; return lerp(arr[i], arr[i + 1], t); };
     // centre-line slope (degrees, towards the tail)
@@ -1066,12 +1126,12 @@ function buildHairPaths(geo, face, reveal) {
       const ya = (at(topB, a) + at(botB, a)) / 2, yb = (at(topB, b) + at(botB, b)) / 2;
       return Math.atan2(-(yb - ya), (b - a) * span) * 180 / Math.PI;
     };
-    const tipX = face.midX + sg * geo.tailHalf, tipY = (at(topB, 1) + at(botB, 1)) / 2;
-    const archU = clamp((geo.archHalf - geo.innerHalf) / span, 0.3, 0.85);
+    const tipX = face.midX + sg * side.tailHalf, tipY = (at(topB, 1) + at(botB, 1)) / 2;
+    const archU = clamp((side.archHalf - side.innerHalf) / span, 0.3, 0.85);
     for (const h of seeds[si]) {
       if (h.u > reveal * 1.05) break;
       const top = at(topB, h.u), bot = at(botB, h.u), hh = Math.max(1, bot - top);
-      const x = face.midX + sg * (geo.innerHalf + h.u * span);
+      const x = face.midX + sg * (side.innerHalf + h.u * span);
       const y = bot - h.v * hh;
       const ax = axis(h.u);
       // direction
@@ -1520,6 +1580,7 @@ function rebuild() {
   if (!state.face) return;
   const prev = state.brows;
   state.brows = mapBrows(state.face, settings());
+  syncOutputs();
   state.timeline = buildTimeline(state.face, state.brows);
   if (!state.playing) {
     const atEnd = state.t >= state.timeline.end - 1e-6;
@@ -1558,6 +1619,7 @@ function showMeasurements() {
     ['Arch lift', mm(g.innerTopY - g.archTopY)],
     ['Gap above pupil', mm(f.eyeY - g.archTopY)],
     ['Face symmetry', symmetryScore(f)],
+    ['Face shape', tr(SHAPE_NAMES[g.faceShape.shape]) + (g.faceShape.auto ? ' · ' + tr('auto') : '')],
   ];
   els.measureList.innerHTML = rows.map(([k, v]) => `<dt>${tr(k)}</dt><dd dir="ltr">${v}</dd>`).join('');
   els.measure.hidden = false;
@@ -1864,6 +1926,7 @@ async function loadFile(file) {
     // new brows in exactly the colour of the brows that were erased
     try { matchBrowColour(); } catch (e) { console.warn('colour match skipped', e); }
     state.timeline = buildTimeline(state.face, state.brows);
+    syncOutputs();
     play();
   } catch (err) {
     if (!alive()) return;
@@ -2248,6 +2311,7 @@ function syncOutputs() {
   $('archV').textContent = `${Math.round(+els.arch.value * 100)}%`;
   $('tailV').textContent = `${Math.round(+els.tail.value * 100)}%`;
   $('gapV').textContent = `${Math.round(+els.gap.value * 100)}%`;
+  if (state.brows && state.brows.faceShape) $('shapeV').textContent = tr(SHAPE_NAMES[state.brows.faceShape.shape]);
 }
 
 els.file.addEventListener('change', () => loadFile(els.file.files[0]));
@@ -2261,7 +2325,7 @@ const holdOff = () => { if (!state.showOriginal) return; state.showOriginal = fa
 els.compare.addEventListener('pointerdown', holdOn);
 ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => els.compare.addEventListener(ev, holdOff));
 
-[els.thick, els.lift, els.arch, els.tail, els.gap, els.color, els.style].forEach((el) =>
+[els.thick, els.lift, els.arch, els.tail, els.gap, els.color, els.style, els.faceShape].forEach((el) =>
   el.addEventListener('input', () => { syncOutputs(); scheduleRebuild(); }));
 for (const el of [els.thick, els.lift, els.arch, els.tail, els.gap]) {
   el.addEventListener('pointerdown', () => { state.dragging = true; });

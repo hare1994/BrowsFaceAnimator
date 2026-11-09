@@ -55,6 +55,7 @@
       <aside class="panel card" id="panel">
         <!-- phone: pick one control at a time -->
         <div class="chips" id="chips" role="tablist">
+          <button type="button" class="chip" data-for="shape" data-i18n="Face shape">Face shape</button>
           <button type="button" class="chip" data-for="thick" data-i18n="Thickness">Thickness</button>
           <button type="button" class="chip" data-for="lift" data-i18n="Arch height">Arch height</button>
           <button type="button" class="chip" data-for="arch" data-i18n="Arch position">Arch position</button>
@@ -67,6 +68,16 @@
 
         <fieldset class="controls" id="controls" disabled>
           <legend data-i18n="Shape">Shape</legend>
+          <label class="ctl" data-ctl="shape"><span class="ctl-head"><span data-i18n="Face shape">Face shape</span><output id="shapeV"></output></span>
+            <select id="faceShape">
+              <option value="auto" selected data-i18n="Automatic (detected)">Automatic (detected)</option>
+              <option value="oval" data-i18n="Oval">Oval</option>
+              <option value="round" data-i18n="Round">Round</option>
+              <option value="square" data-i18n="Square">Square</option>
+              <option value="heart" data-i18n="Heart">Heart</option>
+              <option value="long" data-i18n="Long">Long</option>
+            </select>
+          </label>
           <label class="ctl" data-ctl="thick"><span class="ctl-head"><span data-i18n="Thickness">Thickness</span><output id="thickV"></output></span>
             <input type="range" id="thick" min="0.6" max="1.5" step="0.01" value="1">
           </label>
