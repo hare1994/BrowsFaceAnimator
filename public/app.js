@@ -1,5 +1,6 @@
 import { FaceLandmarker, FilesetResolver } from './vendor/mediapipe/vision_bundle.mjs';
 import { removeBrowsData, dilateMask, boxBlur } from './removal.js';
+import { t as tr, applyLang, setLang, getLang, onLangChange } from './i18n.js';
 
 /* ------------------------------------------------------------------ *
  * Brow Mapping Studio
@@ -1297,7 +1298,7 @@ function render(t, c = ctx, opts = {}) {
 
   // caption
   let cap = '';
-  for (const [ct, text] of tl.captions) if (t >= ct) cap = text;
+  for (const [ct, text] of tl.captions) if (t >= ct) cap = tr(text);
   if (opts.burnCaption) burnCaption(c, cap);
   else if (c === ctx && els.caption.textContent !== cap) els.caption.textContent = cap;
 }
@@ -1310,6 +1311,7 @@ function burnCaption(c, text) {
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.font = `700 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
   c.textAlign = 'center'; c.textBaseline = 'bottom';
+  c.direction = getLang() === 'he' ? 'rtl' : 'ltr';
   c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = size * 0.5;
   c.fillStyle = '#fff';
   c.fillText(text, W / 2, H - size * 1.1);
@@ -1389,7 +1391,7 @@ function renderIntro(c, t) {
     c.beginPath(); c.arc(q.x + q.vx * age, q.y + q.vy * age, q.r * (1 - k * 0.5), 0, Math.PI * 2); c.fill();
   }
   c.restore();
-  burnCaption(c, t < 1.0 ? 'Analysing the face' : 'Erasing the brows');
+  burnCaption(c, tr(t < 1.0 ? 'Analysing the face' : 'Erasing the brows'));
 }
 
 /* ------------------------------ playback ------------------------------ */
@@ -1447,7 +1449,7 @@ function showMeasurements() {
     ['Gap above pupil', mm(f.eyeY - g.archTopY)],
     ['Face symmetry', symmetryScore(f)],
   ];
-  els.measureList.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  els.measureList.innerHTML = rows.map(([k, v]) => `<dt>${tr(k)}</dt><dd dir="ltr">${v}</dd>`).join('');
   els.measure.hidden = false;
 }
 
@@ -1485,7 +1487,8 @@ function busyStage(text, from, to, ms, subs = []) {
   busy.from = Math.max(from, busy.shown); busy.to = to; busy.stageMs = Math.max(200, ms);
   busy.stageStart = performance.now();
   busy.subs = subs; busy.subIdx = -1; busy.subT = 0;
-  busyEls.text.textContent = text;
+  busy.textKey = text;
+  busyEls.text.textContent = tr(text);
 }
 function busySetImage(canvas) {
   // if a fade is still running, freeze what is on screen right now as the new
@@ -1543,7 +1546,7 @@ function busyFrame(now) {
   if (busy.subs.length && (busy.subIdx < 0 || now - busy.subT > 2300)) {
     busy.subIdx = (busy.subIdx + 1) % busy.subs.length; busy.subT = now;
     busyEls.sub.style.opacity = 0;
-    const msg = busy.subs[busy.subIdx];
+    const msg = tr(busy.subs[busy.subIdx]);
     setTimeout(() => { busyEls.sub.textContent = msg; busyEls.sub.style.opacity = 1; }, 180);
   } else if (!busy.subs.length && busyEls.sub.textContent) busyEls.sub.textContent = '';
 
@@ -1680,7 +1683,7 @@ async function loadFile(file) {
     const res = lmk.detect(orig);
     if (!res.faceLandmarks || !res.faceLandmarks.length) {
       busyFail();
-      setStatus('No face found. Try a well-lit, front-facing photo.', true);
+      setStatus(tr('No face found. Try a well-lit, front-facing photo.'), true);
       document.documentElement.dataset.browState = 'error';
       return;
     }
@@ -1743,7 +1746,7 @@ async function loadFile(file) {
     if (window.__brow) window.__brow.maxGap = Math.round(busy.maxGap);
     await busyFinish(alive);
     if (!alive()) return;
-    if (aiFailed) showAiNotice('AI erase failed, so a basic erase was used. Reason: ' + (window.__brow && window.__brow.aiError || 'unknown') + '. Open this page with ?diag=1 at the end of the address for a full check.');
+    if (aiFailed) showAiNotice(tr('AI erase failed, so a basic erase was used. Reason: ') + (window.__brow && window.__brow.aiError || 'unknown') + tr('. Open this page with ?diag=1 at the end of the address for a full check.'));
     if (hair) els.color.value = hair;
     syncOutputs();
     try { await loadBrowTemplate(); } catch { if (els.style.value === 'natural') els.style.value = 'strokes'; }
@@ -1757,7 +1760,7 @@ async function loadFile(file) {
     if (!alive()) return;
     console.error(err);
     busyFail();
-    setStatus('Something went wrong: ' + (err && err.message ? err.message : err), true);
+    setStatus(tr('Something went wrong: ') + (err && err.message ? err.message : err), true);
     document.documentElement.dataset.browState = 'error';
   }
 }
@@ -1852,7 +1855,7 @@ function saveVideo() {
   if (recording) return;
   const types = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
   const type = typeof MediaRecorder !== 'undefined' && types.find((t) => MediaRecorder.isTypeSupported(t));
-  if (!type) { setStatus('Video recording is not supported in this browser.', true); return; }
+  if (!type) { setStatus(tr('Video recording is not supported in this browser.'), true); return; }
   const { W, H } = state;
   const rc = document.createElement('canvas');
   rc.width = W; rc.height = H;
@@ -1862,14 +1865,14 @@ function saveVideo() {
   const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 6_000_000 });
   const chunks = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  const label = els.saveVid.textContent;
+  const labelEl = $('saveVidLabel');
   const total = INTRO + state.timeline.end + 1.2;
   recording = true;
   els.saveVid.disabled = true;
   rec.onstop = () => {
     recording = false;
     els.saveVid.disabled = false;
-    els.saveVid.textContent = label;
+    labelEl.textContent = tr('Save animation');
     download(new Blob(chunks, { type }), `brow-mapping.${type.includes('mp4') ? 'mp4' : 'webm'}`);
   };
   rec.start();
@@ -1878,7 +1881,7 @@ function saveVideo() {
     const t = (now - t0) / 1000;
     if (t < INTRO) renderIntro(rctx, t);
     else render(Math.min(t - INTRO, state.timeline.end), rctx, { burnCaption: true });
-    els.saveVid.textContent = `Saving… ${Math.min(99, Math.round(t / total * 100))}%`;
+    labelEl.textContent = `${tr('Saving…')} ${Math.min(99, Math.round(t / total * 100))}%`;
     if (t < total) requestAnimationFrame(frame);
     else rec.stop();
   };
@@ -1886,6 +1889,31 @@ function saveVideo() {
 }
 
 /* ------------------------------ UI wiring ------------------------------ */
+
+// language
+$('lang').addEventListener('click', () => setLang(getLang() === 'he' ? 'en' : 'he'));
+onLangChange(() => {
+  if (busy.on && busy.textKey) busyEls.text.textContent = tr(busy.textKey);
+  if (state.brows && !els.measure.hidden) showMeasurements();
+  if (state.timeline && !state.playing && !busy.on) render(state.t);
+  requestAnimationFrame(placeStageTools);
+});
+
+// phone controls: one control at a time, picked from the chip row
+const chips = [...document.querySelectorAll('#chips .chip')];
+function selectChip(key) {
+  for (const c of chips) c.classList.toggle('on', c.dataset.for === key);
+  for (const el of document.querySelectorAll('#panel .ctl')) el.classList.toggle('on', el.dataset.ctl === key);
+  els.studio.dataset.ctl = key;
+}
+for (const c of chips) c.addEventListener('click', () => { selectChip(c.dataset.for); c.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' }); });
+selectChip('thick');
+// keep the photo sized to the space left above the control dock
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => {
+  document.documentElement.style.setProperty('--dock-h', $('panel').offsetHeight + 'px');
+  placeStageTools();
+}).observe($('panel'));
+applyLang();
 
 function syncOutputs() {
   $('thickV').textContent = `${Math.round(+els.thick.value * 100)}%`;

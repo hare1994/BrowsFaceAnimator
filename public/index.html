@@ -11,8 +11,9 @@
 </head>
 <body>
   <header class="top">
-    <h1>Brow Mapping Studio</h1>
-    <p class="sub">Front-facing photo in. Brows removed, mapped and redrawn from her own facial measurements.</p>
+    <button id="lang" class="lang" type="button" aria-label="Switch language">עברית</button>
+    <h1 data-i18n="Brow Mapping Studio">Brow Mapping Studio</h1>
+    <p class="sub" data-i18n="Front-facing photo in. Brows removed, mapped and redrawn from her own facial measurements.">Front-facing photo in. Brows removed, mapped and redrawn from her own facial measurements.</p>
   </header>
 
   <main>
@@ -22,13 +23,13 @@
         <span class="drop-icon" aria-hidden="true">
           <svg viewBox="0 0 48 48" width="44" height="44"><path d="M8 26 Q24 10 40 22" stroke="currentColor" stroke-width="3.5" fill="none" stroke-linecap="round"/><circle cx="16" cy="32" r="3" fill="currentColor"/><circle cx="32" cy="32" r="3" fill="currentColor"/></svg>
         </span>
-        <strong>Choose a photo</strong>
-        <span>or drop it here</span>
+        <strong data-i18n="Choose a photo">Choose a photo</strong>
+        <span data-i18n="or drop it here">or drop it here</span>
       </label>
       <ul class="tips">
-        <li>Head only, facing the camera</li>
-        <li>Even light, hair off the forehead</li>
-        <li>Your photo never leaves this device</li>
+        <li data-i18n="Head only, facing the camera">Head only, facing the camera</li>
+        <li data-i18n="Even light, hair off the forehead">Even light, hair off the forehead</li>
+        <li data-i18n="Your photo never leaves this device">Your photo never leaves this device</li>
       </ul>
     </section>
 
@@ -36,63 +37,83 @@
       <div class="stage-wrap">
         <canvas id="stage" aria-label="Brow mapping animation"></canvas>
         <div class="stage-tools">
-          <button id="replay" class="tool primary" disabled aria-label="Replay the animation">
+          <button id="replay" class="tool primary" disabled>
             <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.4-5.7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M4 4v4.5h4.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <span>Replay</span>
+            <span data-i18n="Replay">Replay</span>
           </button>
-          <button id="compare" class="tool" disabled title="Hold to see the original">Hold: original</button>
+          <button id="compare" class="tool" disabled data-i18n="Hold: original">Hold: original</button>
         </div>
         <div class="caption" id="caption"></div>
         <div class="status" id="status" role="status"></div>
         <div class="busy" id="busy" hidden aria-live="polite">
-          <div class="busy-row"><span id="busyText">Starting…</span><span id="busyPct">0%</span></div>
+          <div class="busy-row"><span id="busyText">…</span><span id="busyPct">0%</span></div>
           <div class="busy-bar"><i id="busyFill"></i></div>
           <div class="busy-sub" id="busySub"></div>
         </div>
       </div>
 
       <aside class="panel card" id="panel">
+        <!-- phone: pick one control at a time -->
+        <div class="chips" id="chips" role="tablist">
+          <button type="button" class="chip" data-for="thick" data-i18n="Thickness">Thickness</button>
+          <button type="button" class="chip" data-for="lift" data-i18n="Arch height">Arch height</button>
+          <button type="button" class="chip" data-for="arch" data-i18n="Arch position">Arch position</button>
+          <button type="button" class="chip" data-for="gap" data-i18n="Gap">Gap</button>
+          <button type="button" class="chip" data-for="tail" data-i18n="Tail">Tail</button>
+          <button type="button" class="chip" data-for="look" data-i18n="Colour &amp; style">Colour &amp; style</button>
+          <button type="button" class="chip" data-for="measure" data-i18n="Measurements">Measurements</button>
+        </div>
+
         <fieldset class="controls" id="controls" disabled>
-          <legend>Shape</legend>
-          <label>Thickness <output id="thickV"></output>
+          <legend data-i18n="Shape">Shape</legend>
+          <label class="ctl" data-ctl="thick"><span class="ctl-head"><span data-i18n="Thickness">Thickness</span><output id="thickV"></output></span>
             <input type="range" id="thick" min="0.6" max="1.5" step="0.01" value="1">
           </label>
-          <label>Arch height <output id="liftV"></output>
+          <label class="ctl" data-ctl="lift"><span class="ctl-head"><span data-i18n="Arch height">Arch height</span><output id="liftV"></output></span>
             <input type="range" id="lift" min="0" max="2" step="0.01" value="1">
           </label>
-          <label>Arch position <output id="archV"></output>
+          <label class="ctl" data-ctl="arch"><span class="ctl-head"><span data-i18n="Arch position">Arch position</span><output id="archV"></output></span>
             <input type="range" id="arch" min="0.85" max="1.15" step="0.01" value="1">
           </label>
-          <label>Gap between brows <output id="gapV"></output>
+          <label class="ctl" data-ctl="gap"><span class="ctl-head"><span data-i18n="Gap between brows">Gap between brows</span><output id="gapV"></output></span>
             <input type="range" id="gap" min="0.75" max="1.25" step="0.01" value="1">
           </label>
-          <label>Tail length <output id="tailV"></output>
+          <label class="ctl" data-ctl="tail"><span class="ctl-head"><span data-i18n="Tail length">Tail length</span><output id="tailV"></output></span>
             <input type="range" id="tail" min="0.8" max="1.15" step="0.01" value="1">
           </label>
-          <div class="split">
-            <label class="color">Colour <input type="color" id="color" value="#3b2a22"></label>
-            <label>Style
+          <div class="split ctl" data-ctl="look">
+            <label class="color"><span data-i18n="Colour">Colour</span> <input type="color" id="color" value="#3b2a22"></label>
+            <label><span data-i18n="Style">Style</span>
               <select id="style">
-                <option value="natural" selected>Natural (photo-real)</option>
-                <option value="strokes">Hair strokes</option>
-                <option value="both">Hair strokes + powder</option>
-                <option value="powder">Powder</option>
+                <option value="natural" selected data-i18n="Natural (photo-real)">Natural (photo-real)</option>
+                <option value="strokes" data-i18n="Hair strokes">Hair strokes</option>
+                <option value="both" data-i18n="Hair strokes + powder">Hair strokes + powder</option>
+                <option value="powder" data-i18n="Powder">Powder</option>
               </select>
             </label>
           </div>
         </fieldset>
 
-        <div class="measure" id="measure" hidden>
-          <h2>Her measurements</h2>
+        <div class="measure ctl" id="measure" data-ctl="measure" hidden>
+          <h2 data-i18n="Her measurements">Her measurements</h2>
           <dl id="measureList"></dl>
-          <p class="note">mm values assume an average iris width of 11.7&nbsp;mm.</p>
+          <p class="note" data-i18n="mm values assume an average iris width of 11.7 mm.">mm values assume an average iris width of 11.7 mm.</p>
         </div>
 
-        <div class="row buttons">
-          <button id="savePng" class="btn" disabled>Save image</button>
-          <button id="saveVid" class="btn" disabled>Save animation</button>
+        <div class="actions">
+          <button id="savePng" class="btn" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="M5 17l5-5 4 4 2-2 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            <span data-i18n="Save image">Save image</span>
+          </button>
+          <button id="saveVid" class="btn" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 10l5-3v10l-5-3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            <span id="saveVidLabel" data-i18n="Save animation">Save animation</span>
+          </button>
+          <button id="newPhoto" class="btn ghost">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+            <span data-i18n="New photo">New photo</span>
+          </button>
         </div>
-        <button id="newPhoto" class="btn ghost">New photo</button>
       </aside>
     </section>
   </main>

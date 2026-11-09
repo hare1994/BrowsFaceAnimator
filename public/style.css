@@ -24,7 +24,7 @@ body {
   padding: 0 16px 32px;
 }
 
-.top { max-width: 1100px; margin: 0 auto; padding: 28px 0 18px; text-align: center; }
+.top { position: relative; max-width: 1100px; margin: 0 auto; padding: 28px 0 18px; text-align: center; }
 .top h1 { margin: 0; font-size: clamp(24px, 5vw, 34px); letter-spacing: 0.01em; }
 .top .sub { margin: 6px auto 0; color: var(--muted); max-width: 520px; }
 
@@ -199,3 +199,90 @@ main { max-width: 1100px; margin: 0 auto; }
 @keyframes busy-shine { to { transform: translateX(100%); } }
 .busy-sub { margin-top: 7px; font-size: 12.5px; color: var(--muted); min-height: 1.3em; transition: opacity .3s; }
 @media (prefers-reduced-motion: reduce) { .busy-bar i::after { animation: none; } }
+
+/* ---------- language button ---------- */
+.lang {
+  position: absolute; top: 14px; inset-inline-end: 0;
+  appearance: none; border: 1px solid var(--line); background: rgba(255,255,255,.08);
+  color: var(--text); font: inherit; font-size: 13px; font-weight: 650;
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+}
+.lang:hover { background: rgba(255,255,255,.16); }
+
+/* ---------- controls (desktop: everything visible) ---------- */
+.chips { display: none; }
+.ctl-head { display: flex; justify-content: space-between; gap: 8px; }
+.controls output { float: none; font-variant-numeric: tabular-nums; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.actions #newPhoto { grid-column: 1 / -1; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.btn svg { flex: none; }
+[dir="rtl"] .measure dd { text-align: left; }
+
+/* ---------- phone: photo fills the screen, controls in a bottom dock ---------- */
+@media (max-width: 860px) {
+  body:has(.studio:not([hidden])) .top { padding: 10px 0 6px; }
+  body:has(.studio:not([hidden])) .top h1 { font-size: 18px; }
+  body:has(.studio:not([hidden])) .top .sub { display: none; }
+  body:has(.studio:not([hidden])) .lang { top: 8px; padding: 5px 10px; }
+  body:has(.studio:not([hidden])) { padding-bottom: 0; }
+
+  .studio { display: block; padding-bottom: calc(var(--dock-h, 230px) + 8px); }
+  .studio .stage-wrap { position: relative; top: auto; margin: 0; padding: 0; background: none; }
+  #stage {
+    width: auto; max-width: 100%; margin: 0 auto;
+    max-height: calc(100dvh - var(--dock-h, 230px) - 62px);
+    border-radius: 14px;
+  }
+
+  .panel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+    border-radius: 20px 20px 0 0; border-bottom: 0;
+    padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+    gap: 10px;
+    background: #5a514e;
+    box-shadow: 0 -10px 30px rgba(0,0,0,.35);
+  }
+  .panel::before { /* grab handle */
+    content: ""; display: block; width: 38px; height: 4px; border-radius: 4px;
+    background: rgba(255,255,255,.25); margin: -2px auto 2px;
+  }
+
+  .chips {
+    display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none;
+    margin: 0 -14px; padding: 0 14px 2px; scroll-snap-type: x proximity;
+  }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip {
+    flex: none; scroll-snap-align: center;
+    appearance: none; border: 1px solid var(--line); background: rgba(255,255,255,.07);
+    color: var(--muted); font: inherit; font-size: 13.5px; font-weight: 650;
+    padding: 8px 14px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+    touch-action: manipulation;
+  }
+  .chip.on { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+  .controls { gap: 0; }
+  .controls legend { display: none; }
+  .panel .ctl:not(.on) { display: none !important; }
+  .ctl-head { font-size: 14px; color: var(--text); font-weight: 600; }
+  .controls output { color: var(--accent); }
+  .controls input[type=range] { height: 34px; }
+  .controls input[type=range]::-webkit-slider-thumb { width: 26px; height: 26px; }
+  .split { grid-template-columns: auto 1fr; }
+  .color input { width: 56px; height: 40px; }
+  .controls select { padding: 10px; }
+
+  .measure.on { max-height: 26vh; overflow: auto; }
+  .measure h2 { display: none; }
+  .measure .note { margin-top: 6px; }
+
+  .actions { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .actions #newPhoto { grid-column: auto; }
+  .actions .btn {
+    flex-direction: column; gap: 3px; padding: 8px 4px;
+    font-size: 12px; font-weight: 650; line-height: 1.15; min-height: 54px;
+  }
+
+  .busy { bottom: 10px; }
+}
