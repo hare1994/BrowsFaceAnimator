@@ -390,15 +390,18 @@ function mapBrows(face, s) {
   // 1) start: up from the nostril edge, pulled in towards the bridge of the
   //    nose (never wider than the inner eye corner)
   const innerHalf = Math.min(ax, face.innerCornerHalf) * 0.8 * s.gap;
-  // 2) arch: straight above the outer corner of the eye
-  const archHalf = face.outerHalf * 1.03 * s.arch;
-  const archSlope = (archHalf - ax) / Math.max(1, ay - archTopY);
-  // 3) tail: line from the nostril edge past the outer eye corner
-  //    (clears the corner by ~0.21 eye-widths)
+  // 3) tail (standard mapping): the straight line from the outer edge of the
+  //    nostril through the outer corner of the eye, at tail height
+  //    (tail sits a little above the head, never lower)
   const tailY = innerBotY - 0.06 * eyeW;
-  const slope = (face.outerHalf + 0.21 * eyeW - ax) / (ay - face.outerY); // half-x gained per px climbed
+  const slope = (face.outerHalf - ax) / Math.max(1, ay - face.outerY); // half-x gained per px climbed
   const tailHalfIdeal = ax + slope * (ay - tailY);
   const tailHalf = innerHalf + (tailHalfIdeal - innerHalf) * s.tail;
+  // 2) arch (standard mapping): straight above the outer edge of the iris,
+  //    which lands about two-thirds along the brow
+  const irisEdge = face.irisHalf + face.irisRad;
+  const archHalf = clamp(irisEdge * s.arch, innerHalf + (tailHalf - innerHalf) * 0.5, innerHalf + (tailHalf - innerHalf) * 0.8);
+  const archSlope = (archHalf - ax) / Math.max(1, ay - archTopY);
 
   const sides = [-1, 1].map((sg) => {
     const X = (h) => midX + sg * h;
@@ -642,8 +645,8 @@ function buildTimeline(face, geo) {
       [1.8, 'Centre line'],
       [2.8, 'Start: inner nose line, straight up'],
       [4.1, 'Brow height'],
-      [6.1, 'Arch: above the outer eye corner'],
-      [7.2, 'Tail: nostril → outer eye corner'],
+      [6.1, 'Arch: above the outer edge of the iris'],
+      [7.2, 'Tail: nostril through the outer eye corner'],
       [9.4, 'Mapping points'],
       [10.3, 'Connecting the shape'],
       [12.6, 'Filling in'],
