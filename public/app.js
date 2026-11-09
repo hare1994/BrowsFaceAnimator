@@ -557,7 +557,9 @@ function mapBrows(face, s) {
     innerHalf, archHalf, tailHalf, innerTopY, innerBotY, archTopY, tailY, thickness, archThick,
     slope, archSlope, sides,
   };
-  geo.strokes = makeStrokes(face, geo, s);
+  // drawn hair strokes are only needed by the 'strokes' styles: build them lazily
+  let strokes = null;
+  Object.defineProperty(geo, 'strokes', { get: () => strokes || (strokes = makeStrokes(face, geo, s)) });
   return geo;
 }
 
@@ -1099,28 +1101,43 @@ function drawBrows(c, progress) {
   const eyeW = state.face.eyeW;
 
   if (s.style === 'natural' && browTpl.meta) {
-    // photo-real: cached at 2x, redrawn only while growing in or after a change
+    // photo-real: drawn only in a box around the brows, at 2x (1x while a
+    // slider is being dragged), and redrawn only when something changed
     const { W, H } = state;
-    const SS = Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
-    if (!natLayer.cv || natLayer.cv.width !== W * SS || natLayer.cv.height !== H * SS) { natLayer.cv = makeCanvas(W * SS, H * SS); natLayer.key = null; }
+    const SS = state.dragging ? 1 : Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
     const reveal = clamp(progress * 1.08);
-    const key = geo.strokes;
-    if (natLayer.key !== key || natLayer.color !== s.color || natLayer.reveal !== reveal || natLayer.op !== state.browOpacity) {
-      const g = natLayer.cv.getContext('2d');
+    let box = natLayer.boxFor === geo ? natLayer.box : null;
+    if (!box) {
+      let x0 = W, y0 = H, x1 = 0, y1 = 0;
+      for (const side of geo.sides) for (const q of side.outline) {
+        const p = faceToImage(q);
+        x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+      }
+      const pad = eyeW * 0.35;
+      x0 = Math.max(0, Math.floor(x0 - pad)); y0 = Math.max(0, Math.floor(y0 - pad));
+      x1 = Math.min(W, Math.ceil(x1 + pad)); y1 = Math.min(H, Math.ceil(y1 + pad));
+      box = { x0, y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) };
+      natLayer.box = box; natLayer.boxFor = geo;
+    }
+    if (!natLayer.cv) natLayer.cv = makeCanvas(1, 1);
+    if (natLayer.key !== geo || natLayer.color !== s.color || natLayer.reveal !== reveal || natLayer.op !== state.browOpacity || natLayer.ss !== SS) {
+      const cv = natLayer.cv;
+      if (cv.width !== box.w * SS || cv.height !== box.h * SS) { cv.width = box.w * SS; cv.height = box.h * SS; }
+      const g = cv.getContext('2d');
       g.setTransform(1, 0, 0, 1, 0, 0);
-      g.clearRect(0, 0, natLayer.cv.width, natLayer.cv.height);
+      g.clearRect(0, 0, cv.width, cv.height);
       g.save();
-      g.setTransform(SS, 0, 0, SS, 0, 0);
+      g.setTransform(SS, 0, 0, SS, -box.x0 * SS, -box.y0 * SS);
       faceTransform(g);
       g.imageSmoothingQuality = 'high';
       drawNaturalBrows(g, geo, state.face, s.color, reveal);
       g.restore();
-      natLayer.key = key; natLayer.color = s.color; natLayer.reveal = reveal; natLayer.op = state.browOpacity;
+      natLayer.key = geo; natLayer.color = s.color; natLayer.reveal = reveal; natLayer.op = state.browOpacity; natLayer.ss = SS;
     }
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.imageSmoothingQuality = 'high';
-    c.drawImage(natLayer.cv, 0, 0, W, H);
+    c.drawImage(natLayer.cv, box.x0, box.y0, box.w, box.h);
     c.restore();
     return;
   }
@@ -1425,6 +1442,14 @@ function finished() {
   els.saveVid.disabled = !('MediaRecorder' in window) || !els.stage.captureStream;
   showMeasurements();
   document.documentElement.dataset.browState = 'done';
+}
+
+// slider moves arrive much faster than frames: rebuild at most once per frame
+let rebuildQueued = false;
+function scheduleRebuild() {
+  if (rebuildQueued) return;
+  rebuildQueued = true;
+  requestAnimationFrame(() => { rebuildQueued = false; rebuild(); });
 }
 
 function rebuild() {
@@ -1935,7 +1960,12 @@ els.compare.addEventListener('pointerdown', holdOn);
 ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => els.compare.addEventListener(ev, holdOff));
 
 [els.thick, els.lift, els.arch, els.tail, els.gap, els.color, els.style].forEach((el) =>
-  el.addEventListener('input', () => { syncOutputs(); rebuild(); }));
+  el.addEventListener('input', () => { syncOutputs(); scheduleRebuild(); }));
+for (const el of [els.thick, els.lift, els.arch, els.tail, els.gap]) {
+  el.addEventListener('pointerdown', () => { state.dragging = true; });
+  const end = () => { if (!state.dragging) return; state.dragging = false; scheduleRebuild(); };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end); el.addEventListener('change', end);
+}
 
 els.savePng.addEventListener('click', savePng);
 els.saveVid.addEventListener('click', saveVideo);
