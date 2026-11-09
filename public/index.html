@@ -37,6 +37,11 @@
         <canvas id="stage" aria-label="Brow mapping animation"></canvas>
         <div class="caption" id="caption"></div>
         <div class="status" id="status" role="status"></div>
+        <div class="busy" id="busy" hidden aria-live="polite">
+          <div class="busy-row"><span id="busyText">Starting…</span><span id="busyPct">0%</span></div>
+          <div class="busy-bar"><i id="busyFill"></i></div>
+          <div class="busy-sub" id="busySub"></div>
+        </div>
       </div>
 
       <aside class="panel card" id="panel">

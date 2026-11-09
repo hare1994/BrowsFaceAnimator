@@ -772,6 +772,7 @@ function getMigan() {
     miganPromise = (async () => {
       ort.env.wasm.wasmPaths = new URL('./vendor/ort/', import.meta.url).href;
       ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+      ort.env.wasm.proxy = true; // run in a worker so the page (and its animation) stays smooth
       const parts = await Promise.all(['migan.part0', 'migan.part1'].map(async (f) => {
         const r = await fetch(new URL('./models/' + f, import.meta.url));
         if (!r.ok) throw new Error('model download failed');
@@ -787,7 +788,7 @@ function getMigan() {
 }
 
 // Repaints the brow mask with MI-GAN, one brow at a time.
-async function aiRemoveBrows(src, brow, face) {
+async function aiRemoveBrows(src, brow, face, onStep = () => {}) {
   const { W, H } = state;
   const { mask, bx0, by0, bw, bh } = brow;
   const session = await getMigan();
@@ -797,38 +798,57 @@ async function aiRemoveBrows(src, brow, face) {
   const img = sctx.getImageData(0, 0, W, H);
   const d = img.data;
   const midX = face.midX - bx0;
+  // the model only needs the area around the brows (plus context)
+  const cx0 = Math.max(0, bx0 - Math.round(face.eyeW * 0.4)), cy0 = Math.max(0, by0 - Math.round(face.eyeW * 0.3));
+  const cx1 = Math.min(W, bx0 + bw + Math.round(face.eyeW * 0.4)), cy1 = Math.min(H, by0 + bh + Math.round(face.eyeW * 0.5));
+  const cw = cx1 - cx0, ch = cy1 - cy0;
+  const yieldFrame = () => new Promise((r) => setTimeout(r, 0));
   const runMask = async (holeAt) => { // holeAt(x, y) in box coords
-    const known = new Uint8Array(W * H).fill(255);
+    const known = new Uint8Array(cw * ch).fill(255);
     let any = false;
     for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
       if (!holeAt(x, y)) continue;
-      known[(y + by0) * W + (x + bx0)] = 0; any = true;
+      const X = x + bx0 - cx0, Y = y + by0 - cy0;
+      if (X < 0 || Y < 0 || X >= cw || Y >= ch) continue;
+      known[Y * cw + X] = 0; any = true;
     }
     if (!any) return;
-    const chw = new Uint8Array(3 * W * H);
-    for (let k = 0; k < W * H; k++) { chw[k] = d[k * 4]; chw[W * H + k] = d[k * 4 + 1]; chw[2 * W * H + k] = d[k * 4 + 2]; }
+    const n = cw * ch, chw = new Uint8Array(3 * n);
+    for (let Y = 0; Y < ch; Y++) for (let X = 0; X < cw; X++) {
+      const k = (Y + cy0) * W + (X + cx0), j = Y * cw + X;
+      chw[j] = d[k * 4]; chw[n + j] = d[k * 4 + 1]; chw[2 * n + j] = d[k * 4 + 2];
+    }
+    await yieldFrame();
     const out = await session.run({
-      image: new ort.Tensor('uint8', chw, [1, 3, H, W]),
-      mask: new ort.Tensor('uint8', known, [1, 1, H, W]),
+      image: new ort.Tensor('uint8', chw, [1, 3, ch, cw]),
+      mask: new ort.Tensor('uint8', known, [1, 1, ch, cw]),
     });
+    await yieldFrame();
     const r = out.result.data;
     // composite with a 1 px soft edge
-    for (let y = Math.max(1, by0); y < Math.min(H - 1, by0 + bh); y++) for (let x = Math.max(1, bx0); x < Math.min(W - 1, bx0 + bw); x++) {
-      const k = y * W + x;
+    for (let Y = 1; Y < ch - 1; Y++) for (let X = 1; X < cw - 1; X++) {
+      const j = Y * cw + X;
       let a;
-      if (!known[k]) a = 1;
+      if (!known[j]) a = 1;
       else {
-        let n = 0;
-        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) if (!known[k + oy * W + ox]) n++;
-        a = n / 9 * 0.6;
+        let m = 0;
+        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) if (!known[j + oy * cw + ox]) m++;
+        a = m / 9 * 0.6;
       }
       if (a <= 0) continue;
-      for (let c = 0; c < 3; c++) d[k * 4 + c] = lerp(d[k * 4 + c], r[c * W * H + k], a);
+      const k = ((Y + cy0) * W + (X + cx0)) * 4;
+      for (let c = 0; c < 3; c++) d[k + c] = lerp(d[k + c], r[c * n + j], a);
     }
   };
+  const snapshot = () => { const c = makeCanvas(W, H); c.getContext('2d').putImageData(img, 0, 0); return c; };
   // one brow at a time (more resolution, cleaner context)
+  onStep('side', 0);
   await runMask((x, y) => m2[y * bw + x] && x < midX);
+  onStep('done', 0, snapshot());
+  onStep('side', 1);
   await runMask((x, y) => m2[y * bw + x] && x >= midX);
+  onStep('done', 1, snapshot());
+  onStep('polish');
   // safety pass: hair-like dark specks left (or invented) inside the brow area
   for (let pass = 0; pass < 2; pass++) {
     const Lr = new Float32Array(bw * bh);
@@ -942,76 +962,144 @@ function mapBrows(face, s) {
 }
 
 function makeStrokes(face, geo, s) {
+  // Realistic hair: long, fine, tapered hairs following the natural flow of
+  // a brow - upright fan at the head, lower hairs rising diagonally and
+  // upper hairs lying down (meeting along a spine), everything converging
+  // into the tail. Soft edges come from hair tips, not from a cut outline.
   const { eyeW, midX } = face;
   const probe = makeCanvas(2, 2).getContext('2d');
   const rnd = mulberry32(1234);
   const strokes = [];
   const base = hexToRgb(s.color);
-  const archU = (geo.archHalf - geo.innerHalf) / (geo.tailHalf - geo.innerHalf);
   const span = geo.tailHalf - geo.innerHalf;
-
-  // Three layers, like real brows / microblading:
-  //   0 soft under-hairs (lighter, wider, low opacity)
-  //   1 main hairs
-  //   2 fine dark crisp hairs on top
-  const layers = [
-    { share: 0.3, len: [0.08, 0.16], w: 1.1, alpha: [0.3, 0.5], shade: [1.0, 1.3] },
-    { share: 0.45, len: [0.07, 0.15], w: 0.95, alpha: [0.45, 0.75], shade: [0.8, 1.05] },
-    { share: 0.25, len: [0.05, 0.12], w: 0.75, alpha: [0.6, 0.9], shade: [0.6, 0.85] },
-  ];
+  const archU = clamp((geo.archHalf - geo.innerHalf) / span, 0.3, 0.85);
 
   for (const side of geo.sides) {
-    const xs = side.outline.map((p) => p.x), ys = side.outline.map((p) => p.y);
+    const sg = side.sg;
+    // vertical extent of the brow at each position along it
+    const BINS = 80, topB = new Float32Array(BINS).fill(1e9), botB = new Float32Array(BINS).fill(-1e9);
+    const ol = side.outline;
+    for (let i = 0; i < ol.length; i++) { // walk the outline densely so every slot is filled
+      const p0 = ol[i], p1 = ol[(i + 1) % ol.length];
+      const steps = Math.max(1, Math.ceil(dist(p0, p1)));
+      for (let t = 0; t <= steps; t++) {
+        const px = lerp(p0.x, p1.x, t / steps), py = lerp(p0.y, p1.y, t / steps);
+        const u = clamp((Math.abs(px - midX) - geo.innerHalf) / span);
+        const b = Math.min(BINS - 1, Math.floor(u * BINS));
+        topB[b] = Math.min(topB[b], py); botB[b] = Math.max(botB[b], py);
+      }
+    }
+    for (let b = 0; b < BINS; b++) if (topB[b] > 1e8) { // fill gaps from neighbours
+      let l = b - 1, r = b + 1;
+      while (l >= 0 && topB[l] > 1e8) l--;
+      while (r < BINS && topB[r] > 1e8) r++;
+      const src = l >= 0 ? l : r;
+      if (src >= 0 && src < BINS) { topB[b] = topB[src]; botB[b] = botB[src]; }
+    }
+    const vAt = (u, y) => {
+      const b = Math.min(BINS - 1, Math.floor(u * BINS));
+      return clamp((botB[b] - y) / Math.max(1, botB[b] - topB[b]));
+    };
+    // direction of the brow's centre line at each position (degrees, towards the tail)
+    const axis = new Float32Array(BINS);
+    { // least-squares slope of the centre line over a window of slots
+      const cen = Array.from({ length: BINS }, (_, b) => (topB[b] + botB[b]) / 2);
+      const R = 6;
+      for (let b = 0; b < BINS; b++) {
+        let sx = 0, sy = 0, sxx = 0, sxy = 0, n = 0;
+        for (let k = Math.max(2, b - R); k <= Math.min(BINS - 3, b + R); k++) {
+          const xk = (k / BINS) * span, yk = cen[k];
+          sx += xk; sy += yk; sxx += xk * xk; sxy += xk * yk; n++;
+        }
+        const slope = n > 1 ? (n * sxy - sx * sy) / Math.max(1e-6, n * sxx - sx * sx) : 0;
+        axis[b] = Math.atan(-slope) * 180 / Math.PI;
+      }
+    }
+    const axisAt = (u) => axis[Math.min(BINS - 1, Math.floor(u * BINS))];
+    // area -> number of hairs
+    let area = 0;
+    const o = side.outline;
+    for (let i = 0; i < o.length; i++) { const a = o[i], b = o[(i + 1) % o.length]; area += a.x * b.y - b.x * a.y; }
+    area = Math.abs(area) / 2;
+    const total = Math.round(clamp(area / (eyeW * eyeW) * 4000, 500, 3600) * s.thick);
+    const xs = o.map((p) => p.x), ys = o.map((p) => p.y);
     const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-    const total = Math.round(2600 * s.thick);
+
     let made = 0, tries = 0;
-    while (made < total && tries < total * 50) {
+    while (made < total && tries < total * 60) {
       tries++;
       const x = lerp(minX, maxX, rnd()), y = lerp(minY, maxY, rnd());
       if (!probe.isPointInPath(side.path, x, y)) continue;
       const u = clamp((Math.abs(x - midX) - geo.innerHalf) / span);
-      // sparse, soft head; slightly sparser tail tip
-      if (u < 0.16 && rnd() > 0.3 + 0.7 * smooth(u / 0.16)) continue;
-      if (u > 0.9 && rnd() > 1 - (u - 0.9) * 5) continue;
+      const v = vAt(u, y);
+      // soft, airy head and a fine tail tip
+      if (u < 0.12 && rnd() > 0.25 + 0.75 * smooth(u / 0.12)) continue;
+      if (u > 0.92 && rnd() > 1 - (u - 0.92) * 8) continue;
+      if (v > 0.88 && rnd() > 0.55) continue; // airy top edge
       made++;
 
-      const r = rnd();
-      const L = r < layers[0].share ? 0 : r < layers[0].share + layers[1].share ? 1 : 2;
-      const ly = layers[L];
-
-      // vertical position inside the brow at this x (0 = bottom, 1 = top)
-      const topY = lerp(geo.innerTopY, geo.archTopY, smooth(u / Math.max(archU, 0.01)));
-      const botY = lerp(geo.innerBotY, geo.archTopY + geo.archThick, smooth(u / Math.max(archU, 0.01)));
-      const v = clamp((botY - y) / Math.max(1, botY - topY));
-
-      let a; // degrees above horizontal, pointing towards the tail
-      if (u < 0.18) a = lerp(88, 62, u / 0.18) - v * 12;           // head: hairs stand up, fanning out
-      else if (u < archU) a = lerp(55, 18, smooth((u - 0.18) / Math.max(0.01, archU - 0.18)));
-      else a = lerp(12, -24, smooth((u - archU) / Math.max(0.01, 1 - archU)));
-      if (u >= 0.18) a += (0.5 - v) * 34;  // herringbone: lower hairs rise, upper hairs lie down
-      if (v > 0.75 && u >= 0.18) a -= (v - 0.75) * 40; // groomed, crisp top edge
-      a += (rnd() - 0.5) * 10;
+      // ---- direction (degrees above horizontal, pointing towards the tail) ----
+      // body hairs follow the brow's centre line: lower hairs rise a little
+      // more steeply, upper hairs lie flat (they meet along a soft spine)
+      // hairs rooted near the top edge lift slightly so their tips break the outline
+      const body = axisAt(u) + lerp(26, -5, smooth((v - 0.15) / 0.75)) + (v > 0.8 ? (v - 0.8) * 25 : 0);
+      const headW = 1 - smooth(u / 0.2);
+      let a = lerp(body, 78 - v * 10, headW);   // head: upright, slightly fanned
+      a += (rnd() - 0.5) * 8;
       const rad = (a * Math.PI) / 180;
-      const len = eyeW * lerp(ly.len[0], ly.len[1], rnd()) * (u < 0.15 ? 0.75 : 1);
-      const dx = side.sg * Math.cos(rad) * len, dy = -Math.sin(rad) * len;
-      // hairs curve gently towards the tail
-      const bend = len * lerp(0.08, 0.22, rnd());
-      const nx = side.sg * Math.sin(rad), ny = Math.cos(rad);
-      const shade = lerp(ly.shade[0], ly.shade[1], rnd());
-      const col = { r: clamp(base.r * shade + (L === 0 ? 18 : 0), 0, 255), g: clamp(base.g * shade + (L === 0 ? 10 : 0), 0, 255), b: clamp(base.b * shade, 0, 255) };
+
+      // ---- length / shape ----
+      const lenK = u < 0.12 ? lerp(0.06, 0.11, rnd())
+        : u > 0.88 ? lerp(0.1, 0.17, rnd())
+        : lerp(0.16, 0.3, rnd()) * (0.75 + 0.25 * smooth(u / 0.35));
+      const len = eyeW * lenK;
+      const dx = sg * Math.cos(rad) * len, dy = -Math.sin(rad) * len;
+      // hairs curve clockwise (tip bends towards the tail / downwards)
+      const bend = len * lerp(0.08, 0.18, rnd());
+      const nx = sg * Math.sin(rad), ny = Math.cos(rad);
+
+      // ---- look ----
+      const r = rnd();
+      let L, shade, alpha, w;
+      if (r < 0.22) { L = 0; shade = lerp(1.05, 1.35, rnd()); alpha = lerp(0.18, 0.32, rnd()); w = 1.15; }     // soft under-hairs
+      else if (r < 0.86) { L = 1; shade = lerp(0.5, 1.12, rnd()); alpha = lerp(0.45, 0.92, rnd()); w = 1.0; }   // main, varied
+      else { L = 2; shade = lerp(1.5, 2.0, rnd()); alpha = lerp(0.3, 0.5, rnd()); w = 0.8; }                    // sheen highlights
+      const col = L === 2
+        ? { r: base.r * shade + 25, g: base.g * shade + 22, b: base.b * shade + 22 }
+        : { r: base.r * shade, g: base.g * shade, b: base.b * shade };
       strokes.push({
-        sg: side.sg, u, L,
-        order: u * 0.75 + L * 0.1 + rnd() * 0.05,
+        sg, u, L,
+        order: u * 0.85 + (L === 0 ? 0 : L === 1 ? 0.05 : 0.1) + rnd() * 0.08,
         x, y,
         cx: x + dx * 0.5 + nx * bend, cy: y + dy * 0.5 + ny * bend,
-        ex: x + dx, ey: y + dy,
-        w: Math.max(0.45, eyeW * 0.0068) * ly.w * lerp(0.75, 1.25, rnd()),
-        alpha: lerp(ly.alpha[0], ly.alpha[1], rnd()) * (u < 0.12 ? 0.7 : 1),
-        color: `rgb(${col.r | 0},${col.g | 0},${col.b | 0})`,
+        ex: x + dx + nx * bend * 0.6, ey: y + dy + ny * bend * 0.6,
+        w: Math.max(0.35, eyeW * 0.0058) * w * lerp(0.75, 1.25, rnd()),
+        alpha: alpha * (u < 0.1 ? 0.75 : 1),
+        color: `rgb(${clamp(col.r, 0, 255) | 0},${clamp(col.g, 0, 255) | 0},${clamp(col.b, 0, 255) | 0})`,
+      });
+    }
+    // a few stray hairs just outside the top and bottom edges
+    const strays = Math.round(total * 0.008);
+    for (let i = 0, t = 0; i < strays && t < strays * 80; t++) {
+      const x = lerp(minX, maxX, rnd()), y = lerp(minY - eyeW * 0.04, maxY, rnd());
+      if (probe.isPointInPath(side.path, x, y)) continue;
+      const u = clamp((Math.abs(x - midX) - geo.innerHalf) / span);
+      if (u < 0.15 || u > 0.9) continue;
+      const v = vAt(u, y);
+      if (v < 1 || v > 1.35) continue;
+      i++;
+      const a = axisAt(u) - 4 + (rnd() - 0.5) * 10;
+      const rad = (a * Math.PI) / 180, len = eyeW * lerp(0.08, 0.15, rnd());
+      const dx = sg * Math.cos(rad) * len, dy = -Math.sin(rad) * len;
+      strokes.push({
+        sg, u, L: 1, order: u * 0.85 + 0.12 + rnd() * 0.05, x, y,
+        cx: x + dx * 0.5, cy: y + dy * 0.5, ex: x + dx, ey: y + dy,
+        w: Math.max(0.3, eyeW * 0.0045), alpha: lerp(0.18, 0.35, rnd()),
+        color: `rgb(${base.r | 0},${base.g | 0},${base.b | 0})`,
       });
     }
   }
-  strokes.sort((a, b) => a.L - b.L);
+  strokes.sort((a, b) => a.order - b.order);
   return strokes;
 }
 
@@ -1127,6 +1215,7 @@ function drawGrid(c, alpha) {
 }
 
 const layerCache = { hair: null, powder: null, mask: null, maskKey: '' };
+const hairLayer = { cv: null, key: null, drawn: 0 };
 
 function layerCanvas(key) {
   const { W, H } = state;
@@ -1160,7 +1249,6 @@ function drawBrows(c, progress) {
   const s = settings();
   const geo = state.brows;
   const rgb = hexToRgb(s.color);
-  const mask = browMask();
   const eyeW = state.face.eyeW;
 
   if (s.style !== 'strokes') {
@@ -1192,40 +1280,50 @@ function drawBrows(c, progress) {
   }
 
   if (s.style !== 'powder') {
-    const hv = layerCanvas('hair');
-    const h = hv.getContext('2d');
-    h.setTransform(1, 0, 0, 1, 0, 0);
-    h.clearRect(0, 0, hv.width, hv.height);
-    h.save();
-    faceTransform(h);
-    h.lineCap = 'round';
-    const reveal = clamp(progress) * 1.05;
-    for (const k of geo.strokes) {
-      if (k.order > reveal) continue;
-      h.strokeStyle = k.color;
-      // tapered hair: thick root, fine tip (3 segments along the curve)
-      let px = k.x, py = k.y;
-      for (let i = 1; i <= 3; i++) {
-        const t = i / 3, u = 1 - t;
-        const qx = u * u * k.x + 2 * u * t * k.cx + t * t * k.ex;
-        const qy = u * u * k.y + 2 * u * t * k.cy + t * t * k.ey;
-        h.globalAlpha = k.alpha * (1 - (i - 1) * 0.18);
-        h.lineWidth = k.w * (1.15 - (i - 1) * 0.38);
-        h.beginPath(); h.moveTo(px, py); h.lineTo(qx, qy); h.stroke();
-        px = qx; py = qy;
-      }
+    // Hairs are drawn at 2x resolution (fine, anti-aliased) onto a cached
+    // layer; while the brows grow in, only the newly revealed hairs are added.
+    const { W, H } = state;
+    const SS = Math.min(2, Math.floor(4096 / Math.max(W, H)) || 1);
+    if (!hairLayer.cv || hairLayer.cv.width !== W * SS || hairLayer.cv.height !== H * SS) {
+      hairLayer.cv = makeCanvas(W * SS, H * SS); hairLayer.key = null;
     }
-    h.restore();
-    // fade hairs at the brow edges
-    h.globalCompositeOperation = 'destination-in';
-    h.drawImage(mask, 0, 0);
-    h.globalCompositeOperation = 'source-over';
-
+    const strokes = geo.strokes;
+    const reveal = clamp(progress) * 1.05;
+    let target = 0;
+    while (target < strokes.length && strokes[target].order <= reveal) target++;
+    const h = hairLayer.cv.getContext('2d');
+    if (hairLayer.key !== strokes || target < hairLayer.drawn) {
+      h.setTransform(1, 0, 0, 1, 0, 0);
+      h.clearRect(0, 0, hairLayer.cv.width, hairLayer.cv.height);
+      hairLayer.key = strokes; hairLayer.drawn = 0;
+    }
+    if (target > hairLayer.drawn) {
+      h.save();
+      h.setTransform(SS, 0, 0, SS, 0, 0);
+      faceTransform(h);
+      h.lineCap = 'round';
+      for (let n = hairLayer.drawn; n < target; n++) {
+        const k = strokes[n];
+        h.strokeStyle = k.color;
+        // tapered hair: thick root, fine tip (4 segments along the curve)
+        let px = k.x, py = k.y;
+        for (let i = 1; i <= 4; i++) {
+          const t = i / 4, u = 1 - t;
+          const qx = u * u * k.x + 2 * u * t * k.cx + t * t * k.ex;
+          const qy = u * u * k.y + 2 * u * t * k.cy + t * t * k.ey;
+          h.globalAlpha = k.alpha * (1 - (i - 1) * 0.15);
+          h.lineWidth = k.w * (1.1 - (i - 1) * 0.28);
+          h.beginPath(); h.moveTo(px, py); h.lineTo(qx, qy); h.stroke();
+          px = qx; py = qy;
+        }
+      }
+      h.restore();
+      hairLayer.drawn = target;
+    }
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
-    // a hint of softness so hairs sit in the photo instead of on top of it
-    c.filter = `blur(${Math.max(0.25, eyeW * 0.0025)}px)`;
-    c.drawImage(hv, 0, 0);
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(hairLayer.cv, 0, 0, W, H);
     c.restore();
   }
 }
@@ -1393,6 +1491,156 @@ function symmetryScore(f) {
   return `${Math.round(clamp(1 - e * 6) * 100)}%`;
 }
 
+/* ------------------------------ working animation ------------------------------
+ * Runs while the photo is being analysed and the brows are erased:
+ * a soft scanning beam, the face mesh twinkling in, particles rising from the
+ * brow being erased, and a progress bar whose label and hint change over time.
+ * --------------------------------------------------------------------------- */
+const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const busy = {
+  on: false, raf: 0, t0: 0, last: 0, maxGap: 0,
+  base: null, next: null, fadeStart: 0,
+  face: null, faceT: 0, spawn: null, side: -1, midX: 0,
+  particles: [],
+  from: 0, to: 0, stageStart: 0, stageMs: 1000, shown: 0,
+  subs: [], subIdx: -1, subT: 0,
+};
+const busyTimes = { side: 3000 };
+const busyEls = { box: $('busy'), text: $('busyText'), pct: $('busyPct'), fill: $('busyFill'), sub: $('busySub') };
+
+function busyStart(img) {
+  busy.on = true; busy.base = img; busy.next = null; busy.face = null; busy.spawn = null;
+  busy.particles = []; busy.shown = 0; busy.maxGap = 0;
+  busy.t0 = busy.last = performance.now();
+  busyEls.box.hidden = false;
+  cancelAnimationFrame(busy.raf);
+  busy.raf = requestAnimationFrame(busyFrame);
+}
+function busyStage(text, from, to, ms, subs = []) {
+  busy.from = Math.max(from, busy.shown); busy.to = to; busy.stageMs = Math.max(200, ms);
+  busy.stageStart = performance.now();
+  busy.subs = subs; busy.subIdx = -1; busy.subT = 0;
+  busyEls.text.textContent = text;
+}
+function busySetImage(canvas) { busy.next = canvas; busy.fadeStart = performance.now(); }
+function busySetFace(face) { busy.face = face; busy.faceT = performance.now(); }
+function busySetBrow(brow, face) {
+  const pts = [];
+  const { mask, bx0, by0, bw, bh } = brow;
+  for (let k = 0; k < mask.length; k += 3) if (mask[k]) pts.push([(k % bw) + bx0, ((k / bw) | 0) + by0]);
+  busy.spawn = pts; busy.midX = face.midX;
+}
+function busyFinish() {
+  return new Promise((resolve) => {
+    busyStage('Done', busy.shown, 1, 250);
+    busy.to = 1; busy.from = 1;
+    setTimeout(() => {
+      busyEls.box.hidden = true;
+      busy.on = false;
+      cancelAnimationFrame(busy.raf);
+      resolve();
+    }, 420);
+  });
+}
+function busyFail() { busy.on = false; cancelAnimationFrame(busy.raf); busyEls.box.hidden = true; }
+
+function busyFrame(now) {
+  if (!busy.on) return;
+  busy.maxGap = Math.max(busy.maxGap, now - busy.last);
+  busy.last = now;
+  const t = (now - busy.t0) / 1000;
+  const { W, H } = state;
+  const c = ctx;
+
+  // progress: eases towards the end of the current stage, never stalls, never goes back
+  const e = 1 - Math.exp(-(now - busy.stageStart) / busy.stageMs);
+  const target = busy.from + (busy.to - busy.from) * (busy.to >= 1 ? 1 : e * 0.97);
+  busy.shown = Math.max(busy.shown, busy.shown + (target - busy.shown) * 0.12);
+  const pct = Math.min(100, Math.round(busy.shown * 100));
+  busyEls.pct.textContent = pct + '%';
+  busyEls.fill.style.width = (busy.shown * 100).toFixed(1) + '%';
+
+  // rotating hint under the bar
+  if (busy.subs.length && (busy.subIdx < 0 || now - busy.subT > 2300)) {
+    busy.subIdx = (busy.subIdx + 1) % busy.subs.length; busy.subT = now;
+    busyEls.sub.style.opacity = 0;
+    const msg = busy.subs[busy.subIdx];
+    setTimeout(() => { busyEls.sub.textContent = msg; busyEls.sub.style.opacity = 1; }, 180);
+  } else if (!busy.subs.length && busyEls.sub.textContent) busyEls.sub.textContent = '';
+
+  // ---- picture ----
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, W, H);
+  if (busy.base) c.drawImage(busy.base, 0, 0);
+  if (busy.next) {
+    const a = smooth((now - busy.fadeStart) / 700);
+    c.save(); c.globalAlpha = a; c.drawImage(busy.next, 0, 0); c.restore();
+    if (a >= 1) { busy.base = busy.next; busy.next = null; }
+  }
+  c.fillStyle = 'rgba(18, 14, 13, 0.16)';
+  c.fillRect(0, 0, W, H);
+  if (reduceMotion) { busy.raf = requestAnimationFrame(busyFrame); return; }
+
+  const f = busy.face;
+  const unit = f ? f.eyeW : Math.min(W, H) * 0.12;
+  // scanning beam over the face (or the whole photo before the face is found)
+  let y0 = 0, y1 = H;
+  if (f) { y0 = Math.max(0, f.P[10].y - unit * 0.4); y1 = Math.min(H, f.P[152].y + unit * 0.2); }
+  const by = y0 + (y1 - y0) * (0.5 - 0.5 * Math.cos(t * Math.PI * 2 / 3.2));
+  const bh = unit * 0.5;
+  c.save();
+  c.globalCompositeOperation = 'lighter';
+  const g = c.createLinearGradient(0, by - bh, 0, by + bh);
+  g.addColorStop(0, 'rgba(255,230,0,0)'); g.addColorStop(0.5, 'rgba(255,230,0,0.13)'); g.addColorStop(1, 'rgba(255,230,0,0)');
+  c.fillStyle = g; c.fillRect(0, by - bh, W, bh * 2);
+  c.fillStyle = 'rgba(255,240,150,0.35)'; c.fillRect(0, by - 0.75, W, 1.5);
+  c.restore();
+
+  // face mesh twinkling in
+  if (f) {
+    const fin = smooth((now - busy.faceT) / 900);
+    c.save();
+    c.globalCompositeOperation = 'lighter';
+    const r = Math.max(0.8, unit * 0.011);
+    for (let i = 0; i < 468; i += 3) {
+      const p = f.P[i];
+      const near = 1 - smooth(Math.abs(p.y - by) / (unit * 1.2));
+      const a = fin * (0.18 + 0.22 * (0.5 + 0.5 * Math.sin(t * 2.6 + i * 1.7)) + 0.5 * near);
+      c.fillStyle = `rgba(255,248,210,${a.toFixed(3)})`;
+      c.beginPath(); c.arc(p.x, p.y, r, 0, Math.PI * 2); c.fill();
+    }
+    c.restore();
+  }
+
+  // particles rising from the brow being erased
+  if (busy.spawn && busy.spawn.length && busy.side >= 0) {
+    const pool = busy.side === 2 ? busy.spawn : busy.spawn.filter((p) => (busy.side === 0 ? p[0] < busy.midX : p[0] >= busy.midX));
+    if (pool.length) {
+      for (let n = 0; n < 5; n++) {
+        const p = pool[(Math.random() * pool.length) | 0];
+        busy.particles.push({ x: p[0], y: p[1], vx: (Math.random() - 0.5) * unit * 0.004, vy: -unit * (0.004 + Math.random() * 0.008), life: 0, max: 0.7 + Math.random() * 0.9, r: unit * (0.008 + Math.random() * 0.016) });
+      }
+    }
+  }
+  if (busy.particles.length) {
+    c.save();
+    c.globalCompositeOperation = 'lighter';
+    const keep = [];
+    for (const q of busy.particles) {
+      q.life += 1 / 60; q.x += q.vx; q.y += q.vy; q.vy *= 0.995;
+      if (q.life > q.max) continue;
+      keep.push(q);
+      const k = q.life / q.max, a = Math.sin(k * Math.PI) * 0.85;
+      const col = k < 0.5 ? `rgba(255,230,0,${a.toFixed(3)})` : `rgba(255,${Math.round(230 - (k - 0.5) * 2 * 180)},${Math.round((k - 0.5) * 2 * 214)},${a.toFixed(3)})`;
+      c.fillStyle = col;
+      c.beginPath(); c.arc(q.x, q.y, q.r * (1 - k * 0.5), 0, Math.PI * 2); c.fill();
+    }
+    busy.particles = keep.length > 900 ? keep.slice(-900) : keep;
+    c.restore();
+  }
+  busy.raf = requestAnimationFrame(busyFrame);
+}
+
 /* ------------------------------ loading ------------------------------ */
 
 function setStatus(msg, error = false) {
@@ -1431,39 +1679,67 @@ async function loadFile(file) {
   ctx.drawImage(orig, 0, 0);
 
   try {
-    setStatus('Loading face model…');
+    setStatus('');
+    busyStart(orig);
+    busyStage('Getting ready', 0, 0.1, 1500, ['Warming up the face model', 'Loading the skin AI']);
+    const migan = getMigan().catch((e) => { throw e; });
+    migan.catch(() => {});
     const lmk = await getLandmarker();
-    setStatus('Finding her features…');
-    await new Promise((r) => setTimeout(r, 30));
+    busyStage('Finding her face', 0.1, 0.18, 500, ['Locating 478 face points']);
+    await new Promise((r) => setTimeout(r, 60));
     const res = lmk.detect(orig);
     if (!res.faceLandmarks || !res.faceLandmarks.length) {
+      busyFail();
       setStatus('No face found. Try a well-lit, front-facing photo.', true);
       document.documentElement.dataset.browState = 'error';
       return;
     }
     state.face = buildFace(res.faceLandmarks[0], W, H);
-    setStatus('Removing brows…');
-    await new Promise((r) => setTimeout(r, 30));
+    busySetFace(state.face);
+    busyStage('Mapping brow hairs', 0.18, 0.26, 600, ['Tracing every hair', 'Protecting lids and eyeshadow']);
+    await new Promise((r) => setTimeout(r, 450));
     const { canvas, hair, brow } = removeBrows(orig, state.face);
     state.clean = canvas;
+    busySetBrow(brow, state.face);
     // AI repaint (better skin, shading and texture); the classic fill stays as fallback
+    const sideMs = busyTimes.side;
     try {
-      setStatus('Removing brows (AI)…');
+      busyStage('Erasing brow 1 of 2', 0.26, 0.56, sideMs + 1200, ['Rebuilding the skin underneath', 'Matching skin tone', 'Recreating pores and texture']);
+      busy.side = 0;
+      await migan;
+      busy.maxGap = 0; // measure smoothness of the AI phase only
       const t0 = performance.now();
-      state.clean = await aiRemoveBrows(orig, brow, state.face);
+      let tSide = t0;
+      state.clean = await aiRemoveBrows(orig, brow, state.face, (step, side, snap) => {
+        if (step === 'side' && side === 1) {
+          busyStage('Erasing brow 2 of 2', 0.56, 0.86, busyTimes.side, ['Blending with the forehead', 'Keeping the eyelid untouched', 'Softening the edges']);
+          busy.side = 1;
+        } else if (step === 'done') {
+          busyTimes.side = performance.now() - tSide; tSide = performance.now();
+          busySetImage(snap);
+        } else if (step === 'polish') {
+          busyStage('Polishing', 0.86, 0.97, busyTimes.side, ['Checking for any leftover hairs']);
+          busy.side = 2;
+        }
+      });
       if (window.__brow) window.__brow.aiMs = Math.round(performance.now() - t0);
     } catch (e) {
       console.warn('AI brow removal unavailable, using classic fill', e);
       if (window.__brow) window.__brow.aiError = String(e && e.message || e);
     }
+    busy.side = -1;
+    busySetImage(state.clean);
+    await new Promise((r) => setTimeout(r, 650));
+    if (window.__brow) window.__brow.maxGap = Math.round(busy.maxGap);
+    await busyFinish();
     if (hair) els.color.value = hair;
     syncOutputs();
     state.brows = mapBrows(state.face, settings());
     state.timeline = buildTimeline(state.face, state.brows);
-    setStatus('');
     play();
   } catch (err) {
     console.error(err);
+    busyFail();
     setStatus('Something went wrong: ' + (err && err.message ? err.message : err), true);
     document.documentElement.dataset.browState = 'error';
   }
@@ -1535,4 +1811,6 @@ getLandmarker().catch(() => {}); // warm up while the user picks a photo
 getMigan().catch(() => {});
 
 // test hook: render any moment of the animation
-window.__brow = { seek: (t) => { state.playing = false; render(t); }, state };
+window.__brow = { seek: (t) => { state.playing = false; render(t); }, state,
+  prep: (src) => (window.__brow._r = removeBrows(src, state.face)),
+  ai: async (src) => aiRemoveBrows(src, window.__brow._r.brow, state.face, (step) => { (window.__brow.log = window.__brow.log || []).push([step, Math.round(performance.now())]); }) };
