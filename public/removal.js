@@ -92,6 +92,8 @@ function solveHarmonic(img, unk, w, h) {
  *    clean skin nearby.
  * ------------------------------------------------------------------------- */
 
+let INNER_DROP = 0.5;
+export function setInnerDrop(v) { INNER_DROP = v; }
 const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
   152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
 const LID_R = [33, 246, 161, 160, 159, 158, 157, 173, 133];
@@ -221,12 +223,22 @@ export function removeBrowsData(d, W, H, P, eyeW) {
   const lidR = LID_R.map((i) => P[i]), lidL = LID_L.map((i) => P[i]);
   const cR = P[LM.irisR].x, cL = P[LM.irisL].x;
   const floorAt = new Float32Array(bw), lidAt = new Float32Array(bw);
+  // eyelid height; between the inner eye corner and the nose there is no lid,
+  // so keep the height of the lid a little way into the eye (not the low corner)
+  const midXi = (cR + cL) / 2;
+  const lidY = (ix, right) => {
+    const pts = right ? lidR : lidL;
+    const inner = right ? P[133] : P[362], outer = right ? P[33] : P[263];
+    const x22 = lerp(inner.x, outer.x, 0.22);
+    if (Math.abs(ix - midXi) < Math.abs(x22 - midXi)) return lerp(lineY(pts, x22), lineY(pts, ix), INNER_DROP);
+    return lineY(pts, ix);
+  };
   for (let x = 0; x < bw; x++) {
     const ix = x + bx0, right = Math.abs(ix - cR) < Math.abs(ix - cL);
     const fb = lineY(right ? lowR : lowL, ix) + eyeW * 0.3;
-    const fl = lineY(right ? lidR : lidL, ix) - eyeW * 0.1;
-    floorAt[x] = Math.min(fb, fl) - by0;
-    lidAt[x] = lineY(right ? lidR : lidL, ix) - by0;
+    const ly = lidY(ix, right);
+    floorAt[x] = Math.min(fb, ly - eyeW * 0.1) - by0;
+    lidAt[x] = ly - by0;
   }
 
   const rgb = new Float32Array(N * 3), L = new Float32Array(N);
@@ -292,6 +304,44 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     v.sort((a, b) => a - b);
     texThr = (v.length ? v[Math.floor(v.length * 0.6)] : 3) * 1.6 + 1;
   }
+
+  // ---- where the lashes end (per column) ----
+  // From the lash line walk upwards while pixels are lash-black. The brow may
+  // be erased down to just above that point and never below it, so brows set
+  // right on the eye get fully erased while lashes and the lid stay intact.
+  {
+    const eyeSpan = (pts) => [Math.min(...pts.map((p) => p.x)) - bx0, Math.max(...pts.map((p) => p.x)) - bx0];
+    const spans = [eyeSpan(lidR), eyeSpan(lidL)];
+    const lashFloor = new Float32Array(bw).fill(NaN);
+    for (let x = 0; x < bw; x++) {
+      if (!spans.some(([a, b]) => x >= a && x <= b)) continue;
+      const ref = skinAbove[x] || 200, lid = Math.round(lidAt[x]);
+      const top = Math.max(0, Math.round(lidAt[x] - eyeW * 0.25));
+      let lastDark = lid, miss = 0, y = lid;
+      for (; y >= top; y--) {
+        const k = y * bw + x;
+        if (L[k] / ref < 0.45) { lastDark = y; miss = 0; } else if (++miss > 2) break;
+      }
+      // still dark all the way up: lashes run into the brow, assume typical lash length
+      const lashTop = y < top ? lidAt[x] - eyeW * 0.13 : lastDark;
+      lashFloor[x] = Math.min(lashTop - eyeW * 0.015, lidAt[x] - eyeW * 0.04);
+    }
+    // smooth across neighbouring columns, then apply
+    const r = Math.max(2, Math.round(eyeW * 0.03));
+    for (let x = 0; x < bw; x++) {
+      if (Number.isNaN(lashFloor[x])) continue;
+      const v = [];
+      for (let k = x - r; k <= x + r; k++) if (k >= 0 && k < bw && !Number.isNaN(lashFloor[k])) v.push(lashFloor[k]);
+      v.sort((a, b) => a - b);
+      const ix = x + bx0, right = Math.abs(ix - cR) < Math.abs(ix - cL);
+      const fb = lineY(right ? lowR : lowL, ix) + eyeW * 0.3 - by0;
+      floorAt[x] = Math.min(fb, v[v.length >> 1]);
+    }
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const k = y * bw + x;
+      allowed[k] = search[k] && oval[k] && y <= floorAt[x] ? 1 : 0;
+    }
+  }
   // hair test for single pixels: very dark, or darker *and* grainy
   const isHair = (k, ref) => {
     const r = L[k] / ref;
@@ -318,6 +368,7 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     }
     return out;
   })();
+  const TexS = boxBlur(Tex, bw, bh, 1, 1);
   const bandM = new Uint8Array(N);
   const bandTop = new Int32Array(bw).fill(-1), bandBot = new Int32Array(bw).fill(-1);
   for (let x = 0; x < bw; x++) {
@@ -330,7 +381,9 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     for (let y = ya; y <= yb; y++) {
       const k = y * bw + x;
       if (!allowed[k]) continue;
-      const D = (ref - Lh[k]) / ref;
+      // hair-like darkness wins over a smooth shadow (eye socket, lid fold)
+      const hairy = TexS[k] > texThr * 0.7 || Ls[k] / ref < 0.32;
+      const D = (ref - Lh[k]) / ref * (hairy ? 1 : 0.55);
       if (D > bestD) { bestD = D; best = y; }
     }
     if (best < 0 || bestD < 0.1) continue;
@@ -339,7 +392,14 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     let top = best, bot = best;
     const gap = Math.max(1, Math.round(eyeW * 0.015));
     for (let y = best - 1, miss = 0; y >= 0 && miss <= gap; y--) { if (inBand(y)) { top = y; miss = 0; } else miss++; }
-    for (let y = best + 1, miss = 0; y < bh && miss <= gap; y++) { if (inBand(y)) { bot = y; miss = 0; } else miss++; }
+    // going down, a smooth shadow (lid fold) is not brow: it must be very dark
+    // or grainy like hair to count
+    const inBandBelow = (y) => {
+      if (!inBand(y)) return false;
+      const k = y * bw + x, r = Ls[k] / ref;
+      return r < 0.32 || Tex[k] > texThr * 0.75;
+    };
+    for (let y = best + 1, miss = 0; y < bh && miss <= gap; y++) { if (inBandBelow(y)) { bot = y; miss = 0; } else miss++; }
     // a brow is never much thicker than the landmark brow (crease / shadow below)
     const maxT = Math.max((ly - uy) * 1.3, eyeW * 0.15);
     bandTop[x] = top; bandBot[x] = Math.min(bot, Math.round(ly + eyeW * 0.08), Math.round(top + maxT));
@@ -375,20 +435,6 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     let y = bandBot[x] + 1;
     while (y <= lim && Ls[y * bw + x] / ref < 0.45) { bandM[y * bw + x] = 1; bandBot[x] = y; y++; }
   }
-  // brows set right down on the eye: where the band runs into the eyelid limit,
-  // follow brownish, grainy hair a little further down (never the lash line,
-  // never the near-black lashes themselves)
-  for (let x = 0; x < bw; x++) {
-    if (bandBot[x] < 0 || bandBot[x] < Math.floor(floorAt[x]) - 1) continue;
-    const ref = skinAbove[x];
-    const lim = Math.min(bh - 1, Math.floor(lidAt[x] - eyeW * 0.045));
-    for (let y = Math.floor(floorAt[x]) + 1; y <= lim; y++) {
-      const k = y * bw + x, r = L[k] / ref;
-      if (!(r > 0.36 && r < 0.9 && (Tex[k] > texThr * 0.8 || r < 0.75))) break;
-      if (!search[k] || !oval[k]) break;
-      bandM[k] = 1; allowed[k] = 1; bandBot[x] = y;
-    }
-  }
   // brows have no holes: smooth the band outline across columns
   {
     const r = Math.max(1, Math.round(eyeW * 0.02));
@@ -402,6 +448,18 @@ export function removeBrowsData(d, W, H, P, eyeW) {
     if (!mask[k] && bandTop[x] < 0 && coreShape[k] && allowed[k] && isHair(k, skinAbove[x])) mask[k] = 1;
   }
   // stray hairs just outside the band (connected growth, limited distance)
+  // lowest allowed row per column: the band bottom, or (at the brow ends where
+  // no band was found) the nearest band column's bottom / the brow line
+  const botLimit = new Float32Array(bw);
+  for (let x = 0; x < bw; x++) {
+    if (bandBot[x] >= 0) { botLimit[x] = bandBot[x]; continue; }
+    let best = -1, bd = 1e9;
+    for (let k = 1; k < bw; k++) {
+      if (x - k >= 0 && bandBot[x - k] >= 0) { best = bandBot[x - k]; bd = k; break; }
+      if (x + k < bw && bandBot[x + k] >= 0) { best = bandBot[x + k]; bd = k; break; }
+    }
+    botLimit[x] = best >= 0 && bd < eyeW * 0.4 ? best : lowLine[x];
+  }
   {
     const near = dilateMask(mask, bw, bh, Math.max(2, Math.round(eyeW * 0.05)));
     const skin = skinLum(mask);
@@ -413,7 +471,7 @@ export function removeBrowsData(d, W, H, P, eyeW) {
         if (nb < 0 || mask[nb] || !near[nb] || !allowed[nb]) continue;
         const nx = nb % bw, ny = (nb / bw) | 0;
         // never extend downwards past the band (that is lid / eyeshadow)
-        if (bandBot[nx] >= 0 && ny > bandBot[nx]) continue;
+        if (ny > botLimit[nx]) continue;
         if (isHair(nb, Math.max(skin[nb], skinAbove[nx] * 0.97))) { mask[nb] = 1; q.push(nb); }
       }
     }
@@ -595,7 +653,7 @@ export function removeBrowsData(d, W, H, P, eyeW) {
       if (HL > 70) { const k = 70 / HL; hair = rgbToHex({ r: hc.r * k, g: hc.g * k, b: hc.b * k }); }
     }
   }
-  return { out: out.data, hair, mask, bx0, by0, bw, bh };
+  return { out: out.data, hair, mask, bx0, by0, bw, bh, dbg: { bandTop: Array.from(bandTop), bandBot: Array.from(bandBot), floorAt: Array.from(floorAt), lowLine: Array.from(lowLine) } };
 }
 
 
