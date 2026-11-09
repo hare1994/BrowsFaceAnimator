@@ -1985,16 +1985,18 @@ function makeComposer(OW, OH) {
   // when the photo does not fill the frame it is shown as a card on a
   // designed backdrop (built once): a deep gradient in the photo's own tones,
   // a soft glow behind the card, a vignette and fine grain
-  const letterbox = dw < OW - 1 || dh < OH - 1;
+  const letterbox = true;
   let bg = null, card = { x: dx, y: dy, w: dw, h: dh, r: 0 };
   if (letterbox) {
-    // card slightly inset so its rounded corners and shadow show
-    const inset = Math.min(OW, OH) * 0.06;
-    const k2 = Math.min((OW - inset * 2) / W, (OH - inset * 2) / H);
+    // the card never covers the caption: a slot above it (logo / labels) and
+    // below it (captions) are always kept free
+    const inset = Math.min(OW, OH) * 0.05;
+    const topSlot = vertical0 ? OH * 0.11 : OH * 0.1, botSlot = vertical0 ? OH * 0.29 : OH * 0.17;
+    const availW = OW - inset * 2, availH = OH - topSlot - botSlot;
+    const k2 = Math.min(availW / W, availH / H);
     card = { w: W * k2, h: H * k2, r: Math.min(OW, OH) * 0.035 };
     card.x = (OW - card.w) / 2;
-    // vertical: keep the card a bit above centre (captions and app buttons sit below)
-    card.y = vertical0 ? Math.max(inset, (OH - card.h) * 0.4) : (OH - card.h) / 2;
+    card.y = topSlot + (availH - card.h) / 2;
     // average colour of the photo
     const t = document.createElement('canvas'); t.width = 16; t.height = 16;
     const tg = t.getContext('2d', { willReadFrequently: true }); tg.drawImage(state.clean, 0, 0, 16, 16);
@@ -2036,9 +2038,8 @@ function makeComposer(OW, OH) {
     o.direction = getLang() === 'he' ? 'rtl' : 'ltr';
     o.textAlign = 'center'; o.textBaseline = 'middle';
     // Reels/TikTok cover the bottom ~20% with their own buttons: stay above it
-    let y = vertical ? (bg ? Math.min(OH * 0.76, Math.max(OH * 0.66, card.y + card.h - size * 1.6)) : OH * 0.72) : OH * 0.86;
-    // room under the card (inside the safe area)? put the caption there, off the face
-    if (bg) { const below = card.y + card.h + size * 1.9; if (below + size * 1.6 < (vertical ? OH * 0.8 : OH - size)) y = below; }
+    // always in the free slot under the card (never over the face)
+    const y = card.y + card.h + (OH - card.y - card.h) * (vertical ? 0.33 : 0.5);
     const words = text.split(' '), lines = [];
     let line = '';
     for (const w of words) {
@@ -2058,23 +2059,40 @@ function makeComposer(OW, OH) {
     lines.forEach((l, i) => o.fillText(l, OW / 2, top + padY + lh * (i + 0.5)));
     o.restore();
   }
-  function logo() {
+  function logo(atBottom) {
     const img = exportLogo.img;
     if (!img) return;
-    const maxW = OW * (vertical ? 0.3 : 0.18), maxH = OH * 0.09;
-    const k2 = Math.min(maxW / img.width, maxH / img.height);
-    const w = img.width * k2, h = img.height * k2, m = Math.min(OW, OH) * 0.04;
+    const slot = atBottom ? OH - card.y - card.h : card.y;
+    const maxW = OW * (vertical ? 0.34 : 0.2), maxH = slot * 0.62;
+    const k3 = Math.min(maxW / img.width, maxH / img.height);
+    const w = img.width * k3, h = img.height * k3;
+    const y = atBottom ? card.y + card.h + (slot - h) * (vertical ? 0.33 : 0.5) : (slot - h) / 2;
     o.save();
     o.globalAlpha = 0.95;
-    o.shadowColor = 'rgba(0,0,0,0.35)'; o.shadowBlur = m * 0.4;
-    // centred above the card when there is room, else in the top corner
-    if (bg && card.y > h + m * 1.6) o.drawImage(img, (OW - w) / 2, (card.y - h) / 2, w, h);
-    else o.drawImage(img, m, vertical ? OH * 0.06 : m, w, h);
+    o.shadowColor = 'rgba(0,0,0,0.35)'; o.shadowBlur = Math.min(OW, OH) * 0.015;
+    o.drawImage(img, (OW - w) / 2, y, w, h);
+    o.restore();
+  }
+  // Before / After labels in the top slot, each centred over its half
+  function labels(split) {
+    const size = Math.round(Math.min(OW, OH) * (vertical ? 0.06 : 0.05));
+    o.save();
+    o.globalAlpha = split.alpha;
+    o.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+    o.textAlign = 'center'; o.textBaseline = 'middle';
+    const xm = card.x + split.x * (card.w / state.W);
+    const y = card.y / 2;
+    for (const [text, cx] of [[tr('Before'), (card.x + xm) / 2], [tr('After'), (xm + card.x + card.w) / 2]]) {
+      const tw = o.measureText(text).width, pw = tw + size * 1.2, ph = size * 1.6;
+      o.fillStyle = 'rgba(15,12,11,0.7)';
+      o.beginPath(); o.roundRect ? o.roundRect(cx - pw / 2, y - ph / 2, pw, ph, ph / 2) : o.rect(cx - pw / 2, y - ph / 2, pw, ph); o.fill();
+      o.fillStyle = '#fff'; o.fillText(text, cx, y + size * 0.04);
+    }
     o.restore();
   }
   return {
     canvas: out,
-    frame(src, cap) {
+    frame(src, cap, split) {
       o.setTransform(1, 0, 0, 1, 0, 0);
       o.imageSmoothingQuality = 'high';
       if (bg) {
@@ -2088,7 +2106,8 @@ function makeComposer(OW, OH) {
         o.beginPath(); o.roundRect ? o.roundRect(card.x, card.y, card.w, card.h, card.r) : o.rect(card.x, card.y, card.w, card.h); o.stroke(); o.restore();
       } else o.drawImage(src, dx, dy, dw, dh);
       caption(cap);
-      logo();
+      logo(!!split);
+      if (split) labels(split);
     },
   };
 }
@@ -2116,15 +2135,8 @@ function renderOutro(c, t) {
   c.strokeStyle = '#fff'; c.lineWidth = Math.max(3, W * 0.006);
   c.shadowColor = 'rgba(0,0,0,0.4)'; c.shadowBlur = c.lineWidth * 2;
   c.beginPath(); c.moveTo(xTop, 0); c.lineTo(xBot, H); c.stroke();
-  const a = smooth((t - 0.8) / 0.4), size = Math.round(Math.min(W, H) * 0.05);
-  c.globalAlpha = a;
-  c.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
-  c.textBaseline = 'bottom'; c.shadowBlur = size * 0.5; c.shadowColor = 'rgba(0,0,0,0.7)';
-  c.fillStyle = '#fff'; c.textAlign = 'center';
-  const ly = H - size * 0.9, xm = xAt(ly);
-  c.fillText(tr('Before'), xm / 2, ly);
-  c.fillText(tr('After'), xm + (W - xm) / 2, ly);
   c.restore();
+  return { x: (xTop + xBot) / 2, alpha: smooth((t - 0.8) / 0.4) };
 }
 
 // Records the whole story (erasing intro + mapping + before/after) off-screen:
@@ -2166,8 +2178,9 @@ function saveVideo() {
     cap = '';
     if (t < INTRO) renderIntro(rctx, t, { onCaption });
     else if (t < INTRO + main + 0.6) render(Math.min((t - INTRO) * ANIM_SPEED, state.timeline.end), rctx, { onCaption });
-    else { renderOutro(rctx, t - INTRO - main - 0.6); cap = ''; }
-    comp.frame(rc, cap);
+    let split = null;
+    if (t >= INTRO + main + 0.6) { split = renderOutro(rctx, t - INTRO - main - 0.6); cap = ''; }
+    comp.frame(rc, cap, split);
     labelEl.textContent = `${tr('Saving…')} ${Math.min(99, Math.round(t / total * 100))}%`;
     if (t < total) requestAnimationFrame(frame);
     else rec.stop();
