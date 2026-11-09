@@ -1235,6 +1235,7 @@ async function loadFile(file) {
   const alive = () => myRun === loadRun;
   state.playing = false;
   state.browInfo = null;
+  showAiNotice('');
   document.documentElement.dataset.browState = 'loading';
   els.intro.hidden = true;
   els.studio.hidden = false;
@@ -1340,7 +1341,7 @@ async function loadFile(file) {
     if (window.__brow) window.__brow.maxGap = Math.round(busy.maxGap);
     await busyFinish(alive);
     if (!alive()) return;
-    if (aiFailed) { setStatus('AI erase failed, a basic erase was used. Reason: ' + (window.__brow && window.__brow.aiError || 'unknown')); setTimeout(() => { if (alive()) setStatus(''); }, 9000); }
+    if (aiFailed) showAiNotice('AI erase failed, so a basic erase was used. Reason: ' + (window.__brow && window.__brow.aiError || 'unknown') + '. Open this page with ?diag=1 at the end of the address for a full check.');
     if (hair) els.color.value = hair;
     syncOutputs();
     state.brows = mapBrows(state.face, settings());
@@ -1354,6 +1355,58 @@ async function loadFile(file) {
     document.documentElement.dataset.browState = 'error';
   }
 }
+
+
+/* ------------------------------ AI notice + diagnostics ------------------------------ */
+function showAiNotice(text) {
+  let el = document.getElementById('aiNotice');
+  if (!el) {
+    el = document.createElement('p');
+    el.id = 'aiNotice';
+    el.style.cssText = 'margin:10px 0 0;padding:10px 12px;border-radius:10px;background:rgba(160,30,40,.85);color:#fff;font-size:13px;line-height:1.4;user-select:text';
+    document.querySelector('.stage-wrap').after(el);
+  }
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+// ?diag=1 : checks every file the AI needs and tries each AI mode, in this browser
+async function runDiagnostics() {
+  const box = document.createElement('pre');
+  box.style.cssText = 'position:fixed;inset:12px;z-index:99;overflow:auto;margin:0;padding:14px;border-radius:12px;background:#111;color:#e8e8e8;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap';
+  document.body.appendChild(box);
+  const log = (t) => { box.textContent += t + '\n'; };
+  log('Brow app diagnostics — screenshot this and send it\n');
+  log('browser: ' + navigator.userAgent);
+  log('crossOriginIsolated: ' + self.crossOriginIsolated + ' | cores: ' + navigator.hardwareConcurrency + ' | memory(GB): ' + (navigator.deviceMemory || '?'));
+  log('OffscreenCanvas: ' + (typeof OffscreenCanvas !== 'undefined') + ' | SharedArrayBuffer: ' + (typeof SharedArrayBuffer !== 'undefined'));
+  try { log('safe-mode flag: ' + localStorage.getItem('brow-ai-safe')); } catch { log('safe-mode flag: (storage blocked)'); }
+  log('\nfiles:');
+  const files = ['app.js', 'ai-worker.js', 'removal-worker.js', 'removal.js', 'vendor/ort/ort.wasm.min.mjs', 'vendor/ort/ort-wasm-simd-threaded.mjs',
+    'vendor/ort/ort-wasm-simd-threaded.wasm', 'models/migan.part0', 'models/migan.part1', 'models/face_landmarker.task'];
+  for (const f of files) {
+    try {
+      const r = await fetch(new URL('./' + f, import.meta.url), { cache: 'no-store' });
+      const b = await r.arrayBuffer();
+      log(`  ${f}: ${r.status} ${r.headers.get('content-type') || '-'} ${b.byteLength} bytes` + (r.headers.get('cross-origin-embedder-policy') ? ' coep' : ''));
+    } catch (e) { log(`  ${f}: FAILED ${e.message || e}`); }
+  }
+  for (const threads of [Math.min(4, navigator.hardwareConcurrency || 1), 1]) {
+    log(`\nAI test, ${threads} thread(s):`);
+    const t0 = performance.now();
+    try {
+      const m = await startAiWorker(threads);
+      log(`  started in ${Math.round(performance.now() - t0)} ms`);
+      const n = 64 * 64, chw = new Uint8Array(3 * n).fill(170), known = new Uint8Array(n).fill(255);
+      for (let y = 24; y < 40; y++) for (let x = 20; x < 44; x++) known[y * 64 + x] = 0;
+      const t1 = performance.now();
+      await m.run(chw, known, 64, 64);
+      log(`  test image OK in ${Math.round(performance.now() - t1)} ms`);
+    } catch (e) { log('  FAILED: ' + (e.message || e)); }
+  }
+  log('\ndone.');
+}
+if (/[?&]diag=1/.test(location.search)) runDiagnostics();
 
 /* ------------------------------ export ------------------------------ */
 
